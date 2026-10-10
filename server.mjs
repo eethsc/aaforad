@@ -7,12 +7,15 @@ import { runPuctSearch } from './engine/mcts.mjs';
 import { runParEgo } from './engine/parego.mjs';
 import { evaluateSymbolicOracle } from './engine/symbolic.mjs';
 import { detectNgspice, runNgspice } from './engine/simulator.mjs';
+import { buildResearchGraph, queryResearchGraph } from './engine/graphrag.mjs';
+import { callOpenRouterAgent, openRouterConfigured } from './engine/openrouter.mjs';
 
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const RESEARCH_NOTES_PATH = path.join(ROOT_DIR, 'analog_design_agentic_ai_papers.md');
 const MAX_BODY_BYTES = 256 * 1024;
 const responseCache = new Map();
+let researchGraphCache = null;
 
 function loadLocalEnv() {
   const envPath = path.join(ROOT_DIR, '.env');
@@ -136,6 +139,39 @@ const TEMPLATE_LIBRARY = {
   }
 };
 
+function genericTemplate(id, label, family, roleNames, blockLabels) {
+  const roles = roleNames.map(([role, roleLabel], index) => [role, roleLabel, blockLabels[index] || role.toUpperCase()]);
+  const nodes = [
+    { id: 'in', label: 'IN', x: 42, y: 202, kind: 'port' },
+    { id: 'n1', label: 'N1', x: 170, y: 202, kind: 'node' },
+    { id: 'n2', label: 'N2', x: 310, y: 202, kind: 'node' },
+    { id: 'n3', label: 'N3', x: 450, y: 202, kind: 'node' },
+    { id: 'out', label: 'OUT', x: 588, y: 202, kind: 'port' },
+    { id: 'vdd', label: 'VDD', x: 310, y: 54, kind: 'supply' },
+    { id: 'gnd', label: 'VSS', x: 310, y: 354, kind: 'ground' }
+  ];
+  const chain = ['in', 'n1', 'n2', 'n3', 'out'];
+  const edges = blockLabels.slice(0, 4).map((block, index) => [chain[index], chain[index + 1], block]);
+  edges.push(['vdd', 'n2', 'BIAS'], ['n2', 'gnd', 'GND']);
+  return { id, label, shortLabel: label, family, template: blockLabels.join(' + '), roles, nodes, edges, netlistKind: 'generic' };
+}
+
+Object.assign(TEMPLATE_LIBRARY, {
+  telescopic_ota: genericTemplate('telescopic_ota', 'Telescopic OTA', '증폭기', [['input_pair', '입력 차동쌍'], ['cascode', '텔레스코픽 캐스코드'], ['active_load', '능동 부하'], ['bias', '바이어스']], ['DIFFPAIR', 'CASCODE', 'ACTIVE_LOAD', 'BIAS']),
+  folded_cascode_ota: genericTemplate('folded_cascode_ota', 'Folded-cascode OTA', '증폭기', [['input_pair', '입력 차동쌍'], ['folding', '폴딩 브랜치'], ['cascode', '캐스코드'], ['bias', '바이어스']], ['DIFFPAIR', 'FOLD', 'CASCODE', 'BIAS']),
+  common_source_amp: genericTemplate('common_source_amp', 'Common-source amplifier', '증폭기', [['input_stage', '입력단'], ['active_load', '능동 부하'], ['output_stage', '출력단'], ['bias', '바이어스']], ['CS', 'ACTIVE_LOAD', 'OUTPUT', 'BIAS']),
+  current_mirror: genericTemplate('current_mirror', 'Precision current mirror', '바이어스', [['reference', '기준 전류'], ['mirror', '미러 코어'], ['cascode', '캐스코드'], ['bias', '바이어스']], ['IREF', 'MIRROR', 'CASCODE', 'BIAS']),
+  tia: genericTemplate('tia', 'Transimpedance amplifier', '센서 인터페이스', [['input_stage', '입력단'], ['feedback', '피드백'], ['output_stage', '출력단'], ['compensation', '보상']], ['TIA_IN', 'RFB', 'OUTPUT', 'CC']),
+  active_rc_filter: genericTemplate('active_rc_filter', 'Active-RC filter', '필터', [['gm_cell', 'GM 셀'], ['rc_network', 'RC 네트워크'], ['buffer', '버퍼'], ['bias', '바이어스']], ['GM', 'RC', 'BUFFER', 'BIAS']),
+  dynamic_comparator: genericTemplate('dynamic_comparator', 'Dynamic comparator', '데이터 컨버터', [['preamp', '프리앰프'], ['latch', '래치'], ['reset', '리셋'], ['bias', '바이어스']], ['PREAMP', 'LATCH', 'RESET', 'BIAS']),
+  bandgap_reference: genericTemplate('bandgap_reference', 'Bandgap reference', '레퍼런스', [['core', '밴드갭 코어'], ['amplifier', '증폭기'], ['resistor_network', '저항 네트워크'], ['startup', '시작 회로']], ['BJT_CORE', 'EA', 'RES', 'STARTUP']),
+  charge_pump: genericTemplate('charge_pump', 'Charge pump', '전원 관리', [['switch_array', '스위치 배열'], ['capacitor', '플라잉 커패시터'], ['feedback', '피드백'], ['bias', '바이어스']], ['SWITCH', 'CFLY', 'FB', 'BIAS']),
+  ring_oscillator: genericTemplate('ring_oscillator', 'Ring oscillator', '클록', [['delay_cell', '딜레이 셀'], ['bias', '바이어스'], ['buffer', '버퍼'], ['control', '제어']], ['DELAY', 'BIAS', 'BUFFER', 'CTRL']),
+  buck_converter: genericTemplate('buck_converter', 'Buck converter control', '전원 관리', [['switch', '파워 스위치'], ['inductor', '인덕터'], ['feedback', '피드백'], ['control', '제어']], ['SWITCH', 'L', 'FB', 'PWM']),
+  pll: genericTemplate('pll', 'Charge-pump PLL', '클록', [['pfd', 'PFD'], ['charge_pump', '차지 펌프'], ['loop_filter', '루프 필터'], ['vco', 'VCO']], ['PFD', 'CP', 'LF', 'VCO']),
+  delta_sigma_adc: genericTemplate('delta_sigma_adc', 'Delta-sigma ADC modulator', '혼성신호', [['integrator', '적분기'], ['comparator', '비교기'], ['dac', '피드백 DAC'], ['logic', '디지털 로직']], ['INT', 'COMP', 'DAC', 'LOGIC'])
+});
+
 const SOURCE_CARDS = [
   {
     title: 'AaLLM',
@@ -206,27 +242,26 @@ function retrieveKnowledge(spec, template) {
   ].join(' ').toLowerCase();
   const queryTerms = query.match(/[a-z0-9가-힣]+/g) || [];
 
+  let graphResult = { nodes: [], paths: [], graphStats: { nodes: 0, edges: 0 } };
+  try {
+    if (!researchGraphCache) researchGraphCache = buildResearchGraph(readFileSync(RESEARCH_NOTES_PATH, 'utf8'));
+    graphResult = queryResearchGraph(researchGraphCache, query, 7);
+  } catch { /* GraphRAG is unavailable only if the local corpus is missing. */ }
   const ranked = SOURCE_CARDS.map((source) => {
+    const graphNode = graphResult.nodes.find((node) => node.title.includes(source.title));
     const section = researchSection(source.title);
     const normalized = normalizeEvidence(section);
     const lower = normalized.toLowerCase();
-    const score = queryTerms.reduce((sum, term) => sum + (lower.includes(term) ? 1 : 0), 0);
-    const sentences = normalized.split(/(?<=[.!?])\s+/);
-    const evidence = sentences.find((sentence) => {
-      const candidate = sentence.toLowerCase();
-      return queryTerms.some((term) => candidate.includes(term));
-    }) || sentences.find((sentence) => sentence.length > 45) || source.detail;
-    return {
-      ...source,
-      score,
-      evidence: evidence.slice(0, 180)
-    };
+    const score = graphNode?.score || queryTerms.reduce((sum, term) => sum + (lower.includes(term) ? 1 : 0), 0);
+    const evidence = graphNode?.evidence || normalized.split(/(?<=[.!?])\s+/).find((sentence) => sentence.length > 45) || source.detail;
+    return { ...source, score, evidence: evidence.slice(0, 260) };
   }).sort((left, right) => right.score - left.score);
 
   return {
-    mode: existsSync(RESEARCH_NOTES_PATH) ? 'local markdown lexical retrieval' : 'embedded fallback knowledge',
+    mode: existsSync(RESEARCH_NOTES_PATH) ? 'local GraphRAG (evidence graph traversal)' : 'embedded fallback knowledge',
     query: query.slice(0, 220),
-    items: ranked
+    items: ranked,
+    graph: graphResult
   };
 }
 
@@ -243,7 +278,9 @@ function compactText(value, fallback, maxLength) {
 }
 
 export function normalizeInput(input = {}) {
-  const circuit = Object.hasOwn(TEMPLATE_LIBRARY, input.circuit)
+  const circuit = input.circuit === 'auto'
+    ? 'auto'
+    : Object.hasOwn(TEMPLATE_LIBRARY, input.circuit)
     ? input.circuit
     : DEFAULT_INPUT.circuit;
 
@@ -321,7 +358,14 @@ function roleVariableMap(template, spec, seed, action = defaultSizingAction(temp
 }
 
 function topologyGrammar(template, explorationBias) {
-  const choices = template.id === 'two_stage_ota'
+  const choices = template.netlistKind === 'generic'
+    ? [
+      { id: 'interface:input', label: 'input interface', prior: 0.997 },
+      { id: 'core:template', label: 'validated functional core', prior: 0.72 + explorationBias },
+      { id: 'core:exploratory', label: 'exploratory functional core', prior: 0.28 - explorationBias },
+      { id: 'closure:feedback', label: 'feedback/closure', prior: 0.997 }
+    ]
+    : template.id === 'two_stage_ota'
     ? [
       { id: 'input:diffpair', label: 'differential pair', prior: 0.997 },
       { id: 'load:mirror', label: 'current-mirror load', prior: 0.74 + explorationBias },
@@ -342,7 +386,7 @@ function topologyGrammar(template, explorationBias) {
         { id: 'cmp:doubletail', label: 'double-tail comparator', prior: 0.22 - explorationBias },
         { id: 'dac:binary', label: 'binary CDAC', prior: 0.997 }
       ];
-  const stages = template.id === 'ldo' ? [[choices[0]], [choices[1], choices[2]], [choices[3]]]
+  const stages = (template.id === 'ldo' || template.netlistKind === 'generic') ? [[choices[0]], [choices[1], choices[2]], [choices[3]]]
     : [[choices[0]], [choices[1], choices[2]], [choices[3], choices[4]]];
   return stages.map((stage) => stage.map((entry) => ({ ...entry, prior: clamp(entry.prior, 0.001, 0.999) })));
 }
@@ -364,7 +408,9 @@ function completeGrammarState(state, grammar, beamWidth) {
 
 function buildCandidates(template, spec, seed, action = defaultSizingAction(template)) {
   const grammar = topologyGrammar(template, clamp(Number(action.explorationBias) || 0, -0.2, 0.2));
-  const baseline = template.id === 'two_stage_ota'
+  const baseline = template.netlistKind === 'generic'
+    ? ['interface:input', 'core:template', 'closure:feedback']
+    : template.id === 'two_stage_ota'
     ? ['input:diffpair', 'load:mirror', 'comp:miller']
     : template.id === 'ldo'
       ? ['ea:diffpair', 'pass:pmos', 'fb:divider']
@@ -659,7 +705,17 @@ function makeNetlist(template, spec, variables) {
   ];
 
   let body;
-  if (template.id === 'ldo') {
+  if (template.netlistKind === 'generic') {
+    body = [
+      '* Template-constrained structural deck; replace behavioral blocks with PDK subcircuits before sign-off.',
+      'VIN in 0 DC ' + round(spec.supply * 0.45, 3),
+      'RIN in n1 10k',
+      'GCORE n2 0 n1 0 1m',
+      'RF n2 out 20k',
+      'CSTAB out 0 1p',
+      'RLOAD out 0 100k'
+    ];
+  } else if (template.id === 'ldo') {
     body = [
       'VREF vref 0 DC 0.6',
       'MERR ea vref fb vss nmos W=8u L=0.36u',
@@ -914,17 +970,80 @@ async function optionalOpenAIPlanner(spec, template, fallbackPlan) {
   }
 }
 
+function llmRequired() {
+  return process.env.FUSION_REQUIRE_LLM !== 'false';
+}
+
+function graphContext(knowledge) {
+  return JSON.stringify({
+    graph: knowledge.graph?.graphStats,
+    evidence: (knowledge.graph?.nodes || []).map((node) => ({ title: node.title, evidence: node.evidence })),
+    paths: knowledge.graph?.paths || []
+  }).slice(0, 4500);
+}
+
+async function runOpenRouterArchitecture(spec, template, knowledge) {
+  const catalog = Object.values(TEMPLATE_LIBRARY).map((entry) => ({ id: entry.id, label: entry.label, family: entry.family }));
+  const result = await callOpenRouterAgent({
+    name: 'Architect',
+    system: 'You are the Architect in an analog-circuit agent team. Use only GraphRAG evidence supplied by the server. Choose a constrained circuit family, never invent a SPICE netlist.',
+    prompt: `Specification: ${JSON.stringify(spec)}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\nGraphRAG evidence: ${graphContext(knowledge)}\nReturn JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."]}.`,
+    schema: 'architecture-v1'
+  });
+  const selected = TEMPLATE_LIBRARY[result.output.circuit] || template;
+  return { ...result, selectedTemplate: selected, output: { ...result.output, circuit: selected.id } };
+}
+
+async function runOpenRouterPlanner(spec, template, knowledge, architecture) {
+  const roles = template.roles.map(([id]) => id);
+  const result = await callOpenRouterAgent({
+    name: 'Planner',
+    system: 'You are the high-level Planner. Allocate exactly one functional role to a role-specific sizer. You may only return bounded scalar actions; topology and netlist remain locked.',
+    prompt: `Circuit: ${template.label}; allowed roles: ${roles.join(', ')}\nSpec: ${JSON.stringify(spec)}\nArchitect decision: ${JSON.stringify(architecture.output)}\nGraphRAG evidence: ${graphContext(knowledge)}\nReturn JSON {"summary":"string","targetRole":"one allowed role","deviceScale":0.8-1.25,"compensationScale":0.8-1.3,"explorationBias":-0.2..0.2,"knowledgeWrite":"reusable sizing heuristic"}.`,
+    schema: 'planner-v1'
+  });
+  const action = sanitizePlannerAction(result.output, template);
+  return {
+    ...result,
+    enabled: true,
+    action,
+    actionAccepted: roles.includes(result.output.targetRole),
+    text: typeof result.output.summary === 'string' ? result.output.summary.slice(0, 1200) : 'OpenRouter planner action applied.'
+  };
+}
+
+async function runOpenRouterCritic(spec, template, knowledge, sizing, planner) {
+  const roles = template.roles.map(([id]) => id);
+  const result = await callOpenRouterAgent({
+    name: 'Critic',
+    system: 'You are a strict analog-design Critic. Inspect measured or surrogate metrics and constraints. You cannot approve an unverified design and may only request a bounded role action.',
+    prompt: `Spec: ${JSON.stringify(spec)}\nCircuit: ${template.label}\nPlanner action: ${JSON.stringify(planner.action)}\nMetrics: ${JSON.stringify(sizing.metrics)}\nConstraints: ${JSON.stringify(sizing.constraints)}\nGraphRAG evidence: ${graphContext(knowledge)}\nReturn JSON {"verdict":"pass|revise","reason":"string","targetRole":"one of ${roles.join(', ')}","deviceDelta":-0.12..0.12,"compensationDelta":-0.12..0.12}.`,
+    schema: 'critic-v1',
+    temperature: 0.05
+  });
+  return { ...result, output: { ...result.output, targetRole: roles.includes(result.output.targetRole) ? result.output.targetRole : planner.action.targetRole } };
+}
+
+async function runOpenRouterVerifier(spec, template, symbolicOracle, constraints, pdg) {
+  const result = await callOpenRouterAgent({
+    name: 'Verifier',
+    system: 'You are a verification agent. Summarize a PDG-ordered test intent. Do not overrule deterministic SymPy or constraint gates.',
+    prompt: `Circuit: ${template.label}\nSpec: ${JSON.stringify(spec)}\nPDG: ${JSON.stringify(pdg)}\nSymbolic oracle: ${JSON.stringify(symbolicOracle)}\nConstraints: ${JSON.stringify(constraints)}\nReturn JSON {"testIntent":["..."],"riskSummary":"string","llmVerdict":"pass|attention"}.`,
+    schema: 'verifier-v1',
+    temperature: 0.05
+  });
+  return result;
+}
+
 export async function runDesignCycle(rawInput = {}) {
   const spec = normalizeInput(rawInput);
-  const template = TEMPLATE_LIBRARY[spec.circuit];
-  const planningIdentity = isOpenAIPlannerConfigured()
-    ? 'openai:' + process.env.OPENAI_MODEL
-    : 'local';
+  const requestedTemplate = TEMPLATE_LIBRARY[spec.circuit] || TEMPLATE_LIBRARY[DEFAULT_INPUT.circuit];
+  const planningIdentity = openRouterConfigured() ? 'openrouter:' + process.env.OPENROUTER_MODEL : 'llm-unconfigured';
   const cacheKey = createHash('sha256')
-    .update(JSON.stringify({ spec, planningIdentity, engine: 'mcts-parego-sympy-v1' }))
+    .update(JSON.stringify({ spec, planningIdentity, engine: 'graphrag-agent-loop-v2' }))
     .digest('hex');
   const cached = responseCache.get(cacheKey);
-  if (cached) {
+  if (cached && !llmRequired()) {
     return {
       ...cached,
       id: randomUUID(),
@@ -937,17 +1056,45 @@ export async function runDesignCycle(rawInput = {}) {
     };
   }
 
-  const knowledge = retrieveKnowledge(spec, template);
-  const fallbackPlan = makePlannerFallback(template, spec);
-  const planner = await optionalOpenAIPlanner(spec, template, fallbackPlan);
-  const topologySearch = buildCandidates(template, spec, cacheKey, planner.action);
+  const initialKnowledge = retrieveKnowledge(spec, requestedTemplate);
+  if (llmRequired() && !openRouterConfigured()) {
+    throw new Error('LLM agent loop is required. Configure OPENROUTER_API_KEY and OPENROUTER_MODEL.');
+  }
+  const architecture = llmRequired()
+    ? await runOpenRouterArchitecture(spec, requestedTemplate, initialKnowledge)
+    : { name: 'Architect', output: { circuit: requestedTemplate.id, rationale: 'test-only deterministic bypass' }, selectedTemplate: requestedTemplate };
+  const template = architecture.selectedTemplate;
+  const effectiveSpec = { ...spec, circuit: template.id };
+  const knowledge = retrieveKnowledge(effectiveSpec, template);
+  const fallbackPlan = makePlannerFallback(template, effectiveSpec);
+  const planner = llmRequired()
+    ? await runOpenRouterPlanner(effectiveSpec, template, knowledge, architecture)
+    : await optionalOpenAIPlanner(effectiveSpec, template, fallbackPlan);
+  const topologySearch = buildCandidates(template, effectiveSpec, cacheKey, planner.action);
   const candidates = topologySearch.candidates;
   const selected = candidates.find((candidate) => candidate.status === 'selected') || candidates[0];
-  const sizing = runAgenticSizingCycle(template, spec, cacheKey, selected, planner.action);
-  const symbolicOracle = await evaluateSymbolicOracle({ metrics: sizing.metrics, spec });
+  let sizing = runAgenticSizingCycle(template, effectiveSpec, cacheKey, selected, planner.action);
+  const critic = llmRequired()
+    ? await runOpenRouterCritic(effectiveSpec, template, knowledge, sizing, planner)
+    : { name: 'Critic', output: { verdict: 'pass', reason: 'test-only deterministic bypass' } };
+  if (critic.output.verdict === 'revise') {
+    const revisedAction = sanitizePlannerAction({
+      ...planner.action,
+      targetRole: critic.output.targetRole,
+      deviceScale: clamp(planner.action.deviceScale + clamp(Number(critic.output.deviceDelta) || 0, -0.12, 0.12), 0.8, 1.25),
+      compensationScale: clamp(planner.action.compensationScale + clamp(Number(critic.output.compensationDelta) || 0, -0.12, 0.12), 0.8, 1.3)
+    }, template);
+    const revised = runAgenticSizingCycle(template, effectiveSpec, cacheKey + ':critic', selected, revisedAction);
+    if (violationScore(revised.constraints) <= violationScore(sizing.constraints)) sizing = revised;
+  }
+  const symbolicOracle = await evaluateSymbolicOracle({ metrics: sizing.metrics, spec: effectiveSpec });
+  const pdg = makePdg(template);
+  const verifier = llmRequired()
+    ? await runOpenRouterVerifier(effectiveSpec, template, symbolicOracle, sizing.constraints, pdg)
+    : { name: 'Verifier', output: { llmVerdict: 'pass', riskSummary: 'test-only deterministic bypass', testIntent: [] } };
   const exportsAllowed = sizing.verified && symbolicOracle.available && symbolicOracle.allPassed;
-  const exportedNetlist = exportsAllowed ? makeNetlist(template, spec, sizing.variables) : null;
-  const exportedTestbench = exportsAllowed ? makeTestbench(template, spec) : null;
+  const exportedNetlist = exportsAllowed ? makeNetlist(template, effectiveSpec, sizing.variables) : null;
+  const exportedTestbench = exportsAllowed ? makeTestbench(template, effectiveSpec) : null;
   const ngspice = await detectNgspice();
   let simulation = { mode: 'analytic-surrogate', status: ngspice, metrics: null, diagnostics: 'ngspice unavailable; analytic model used for optimization only' };
   if (ngspice.available && exportedNetlist && exportedTestbench) {
@@ -959,15 +1106,16 @@ export async function runDesignCycle(rawInput = {}) {
     createdAt: new Date().toISOString(),
     mode: {
       simulator: simulation.mode === 'ngspice' ? 'ngspice measurement' : 'analytic surrogate (ngspice adapter unavailable)',
-      llm: planner.enabled
-        ? (planner.actionAccepted ? 'server-side OpenAI planner action applied' : 'server-side planner response ignored')
-        : 'local deterministic planner',
+      llm: llmRequired()
+        ? 'OpenRouter Architect → Planner → Critic → Verifier loop completed'
+        : (planner.enabled ? 'legacy test adapter action applied' : 'test-only deterministic bypass'),
       evaluationCount: sizing.iterationHistory.length,
       simulationDiagnostics: simulation.diagnostics,
       fabricationSafe: false
     },
-    spec,
+    spec: effectiveSpec,
     planner,
+    agentLoop: { architecture, planner, critic, verifier, required: llmRequired(), provider: 'OpenRouter' },
     topology: buildTopology(template),
     candidates,
     search: {
@@ -984,8 +1132,8 @@ export async function runDesignCycle(rawInput = {}) {
     iterationHistory: sizing.iterationHistory,
     optimization: sizing.optimization,
     roleKnowledge: sizing.roleKnowledge,
-    pdg: makePdg(template),
-    agents: makeAgentStages(template, spec, sizing.constraints, knowledge),
+    pdg,
+    agents: makeAgentStages(template, effectiveSpec, sizing.constraints, knowledge),
     retrieval: knowledge,
     sources: knowledge.items,
     netlist: exportedNetlist,
@@ -1003,7 +1151,7 @@ export async function runDesignCycle(rawInput = {}) {
       repair: sizing.repair
     }
   };
-  responseCache.set(cacheKey, baseResult);
+  if (!llmRequired()) responseCache.set(cacheKey, baseResult);
   return baseResult;
 }
 
@@ -1074,9 +1222,10 @@ export function createApp() {
       }
       if (request.method === 'GET' && url.pathname === '/api/config') {
         sendJson(response, 200, {
-          simulator: 'local estimator (not SPICE)',
+          simulator: 'ngspice auto-detect with analytic surrogate only when unavailable',
           requestedExternalSimulator: process.env.FUSION_SIMULATOR || 'ngspice adapter auto-detect',
-          llmConfigured: isOpenAIPlannerConfigured(),
+          llmConfigured: openRouterConfigured(),
+          llmRequired: llmRequired(),
           cacheEntries: responseCache.size
         });
         return;

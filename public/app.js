@@ -274,7 +274,7 @@ function artifactText() {
       .join(', ');
     return 'EXPORT BLOCKED\n\n미충족 제약: ' + (failed || 'unknown') + '\n'
       + '수치 제약을 모두 통과한 뒤에만 SPICE 넷리스트와 testbench를 내보낼 수 있습니다.\n'
-      + '현재 결과는 deterministic local estimator의 검토용 기록입니다.';
+      + 'LLM agent loop의 결과이며, 물리 성능은 ngspice/PDK가 없을 때만 analytic surrogate로 표시됩니다.';
   }
   if (state.artifact === 'testbench') return state.result.testbench;
   if (state.artifact === 'variables') return variableArtifact(state.result);

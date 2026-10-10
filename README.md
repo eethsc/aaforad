@@ -1,8 +1,8 @@
 # FUSION Analog Agent Studio
 
-아날로그 회로 설계를 위한 로컬 웹 워크벤치입니다. 사양 입력에서 시작해 제약 토폴로지 선택, 역할 기반 사이징, 수치 검증, 넷리스트·테스트벤치 내보내기까지 하나의 화면에서 확인할 수 있습니다.
+아날로그 회로 설계를 위한 LLM-agent 실행 엔진과 그 웹 관측 화면입니다. 사양 입력에서 시작해 GraphRAG 근거 탐색, Architect→Planner→Critic→Verifier 루프, 토폴로지 탐색, 역할 기반 사이징, 수치 검증, 넷리스트·테스트벤치 내보내기까지 실행합니다.
 
-> 연구용 설계 엔진입니다. PUCT·ParEGO·SymPy 검증은 실제 실행되지만, ngspice/PDK가 없는 경우의 성능 평가는 해석적 surrogate입니다. 제조 또는 테이프아웃 전에 자격을 갖춘 PDK와 독립적인 SPICE/사인오프 검증이 반드시 필요합니다.
+> 연구용 설계 엔진입니다. OpenRouter LLM agent loop, GraphRAG, PUCT·ParEGO·SymPy 검증은 실제 실행됩니다. ngspice/PDK가 없는 경우의 성능 평가는 해석적 surrogate입니다. 제조 또는 테이프아웃 전에 자격을 갖춘 PDK와 독립적인 SPICE/사인오프 검증이 반드시 필요합니다.
 
 ## 실행
 
@@ -31,7 +31,7 @@ npm test
 
 | 단계 | UI / 서버 구현 | 연구 패턴 |
 | --- | --- | --- |
-| Grounding | 사양과 설계 의도를 구조화하고 근거 카드를 생성, component×node 이분 incidence matrix 생성 | AaLLM, ATLAS |
+| Grounding | 논문 요약을 paper/claim/concept 그래프로 구성해 경로 기반 evidence를 회수하고, component×node 이분 incidence matrix 생성 | AaLLM, ATLAS |
 | Topology exploration | 실제 LM-prior PUCT 트리 탐색, partial beam completion, p-filter 자동 커밋 | EXPLORE |
 | Sizing | Planner가 역할을 선택하고 role-sizer가 허용된 변수만 변경, ParEGO/RBF-LCB 탐색 | AgenticSizing, ATLAS |
 | Review loop | 역할별 상태와 재사용 가능한 sizing heuristic 기록 | AaLLM, AgenticSizing |
@@ -40,25 +40,25 @@ npm test
 
 현재 지원 템플릿은 2-stage OTA, LDO, 8-bit SAR ADC입니다. 자유형 LLM 넷리스트 생성을 허용하지 않으며, 선택된 검증 템플릿과 동일한 결과만 생성합니다. local feasibility guard를 포함한 모든 수치 제약을 통과한 결과만 내보냅니다.
 
-## 키 없이도 되는 이유
+## LLM Agent와 GraphRAG
 
-기본 모드는 API 키 없이 작동합니다. 서버는 현재 폴더의 `analog_design_agentic_ai_papers.md`를 읽어 논문 근거를 검색하고, PUCT/ParEGO/SymPy 엔진을 실행합니다. ngspice가 없을 때만 성능 함수는 해석적 surrogate로 동작하며, 그 상태는 API와 UI에 명시됩니다.
+기본 실행 모드는 OpenRouter API 키를 요구합니다. 서버는 `analog_design_agentic_ai_papers.md`를 paper/claim/concept 노드와 공유 개념 edge로 구성한 GraphRAG로 바꾸고, Architect가 회로군을 선택한 뒤 Planner, Critic, Verifier가 각각 JSON action을 반환합니다. LLM이 없으면 production design run을 거부합니다. `FUSION_REQUIRE_LLM=false`은 네트워크 없는 단위 테스트에서만 사용하는 명시적 우회입니다.
 
 서버에는 선택적 LLM planning adapter를 준비해 두었습니다. LLM 출력은 `targetRole`과 제한된 scale 값으로 된 구조화 action으로 파싱한 뒤, 허용된 역할·범위인지 검증될 때만 local sizing 단계에 반영합니다. 토폴로지 잠금과 넷리스트 생성 권한은 LLM에 주지 않습니다. 클라이언트 JavaScript에는 API 키가 전달되지 않으며, 서버 프로세스만 환경변수를 읽습니다.
 
 ## 실제 LLM 연결 준비
 
-아직 키를 넣을 필요는 없습니다. 실제 OpenAI planner를 연결할 때에만 `.env.example`을 `.env`로 복사하고 다음 값을 설정합니다.
+`.env.example`을 `.env`로 복사하고 다음 값을 설정합니다.
 
 ```dotenv
-FUSION_ENABLE_OPENAI=true
-OPENAI_API_KEY=...
-OPENAI_MODEL=...
+FUSION_REQUIRE_LLM=true
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=openrouter/auto
 ```
 
-`server.mjs`는 의존성 없이 `.env`를 읽으며, 키가 없거나 adapter가 실패하면 자동으로 로컬 planner로 돌아갑니다. 키는 절대로 `public/` 파일, 브라우저 콘솔, 응답 JSON에 노출되지 않습니다.
+`server.mjs`는 의존성 없이 `.env`를 읽으며, 키가 없거나 LLM agent가 실패하면 설계 run을 실패 처리합니다. 키는 절대로 `public/` 파일, 브라우저 콘솔, 응답 JSON에 노출되지 않습니다.
 
-OpenAI Responses API는 서버에서만 호출하도록 구성했습니다. API 키는 환경변수 또는 비밀 관리 서비스에 보관해야 한다는 [공식 API 개요](https://developers.openai.com/api/reference/overview)의 인증 지침을 따릅니다.
+OpenRouter의 OpenAI-compatible Chat Completions API를 서버에서만 호출합니다. API 키는 환경변수 또는 비밀 관리 서비스에 보관해야 하며, OpenRouter는 `response_format`으로 구조화 JSON 출력을 지원합니다.
 
 ## 실제 시뮬레이터 연결을 위한 준비
 
@@ -66,7 +66,7 @@ OpenAI Responses API는 서버에서만 호출하도록 구성했습니다. API 
 
 - **ngspice**: `NGSPICE_PATH`에 실행 경로를 설정하고, 실제 PDK model include 경로를 공급해야 합니다.
 - **Cadence**: 유효한 Virtuoso/Maestro 설치 및 라이선스, `CADENCE_PROJECT_DIR`, 쓰기 가능한 `AGENTIC_SIZING_CADENCE_WORK_ROOT`가 필요합니다.
-- **OpenAI planner**: 위의 `OPENAI_API_KEY`, 사용 가능한 `OPENAI_MODEL`이 필요합니다.
+- **OpenRouter agent loop**: 위의 `OPENROUTER_API_KEY`, 사용 가능한 `OPENROUTER_MODEL`이 필요합니다.
 
 이 구조는 [agentic-analog-sizing](https://github.com/aprilaihub/agentic-analog-sizing)의 mock/real adapter 분리와 역할 기반 workflow, 그리고 [AaLLM](https://anonymous.4open.science/r/AaLLM/README.md)의 사양→토폴로지→사이징 폐루프를 참고해 독립적으로 구현했습니다. 외부 저장소 코드를 복사하거나 실행하지 않습니다.
 
@@ -75,6 +75,8 @@ OpenAI Responses API는 서버에서만 호출하도록 구성했습니다. API 
 | 파일 | 역할 |
 | --- | --- |
 | `server.mjs` | 표준 Node 서버, API, 설계 orchestration, 캐시, optional LLM adapter |
+| `engine/graphrag.mjs` | paper/claim/concept evidence graph와 path-aware retrieval |
+| `engine/openrouter.mjs` | 필수 OpenRouter Architect/Planner/Critic/Verifier agent client |
 | `engine/mcts.mjs` | EXPLORE 방식 PUCT, p-filter, partial completion |
 | `engine/parego.mjs` | ATLAS 방식 다목적 ParEGO/RBF-LCB 최적화 |
 | `engine/symbolic_oracle.py` | AnalogVerifier 방식 SymPy 수치 오라클 |

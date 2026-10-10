@@ -107,9 +107,29 @@
               <label class="field">
                 <span>회로 목표</span>
                 <select name="circuit" id="circuit-input">
+                  <option value="auto">AI Auto-select · GraphRAG 기반 선택</option>
+                  <optgroup label="증폭기 · 인터페이스">
                   <option value="two_stage_ota">2-stage OTA · 증폭기</option>
+                  <option value="telescopic_ota">Telescopic OTA · 증폭기</option>
+                  <option value="folded_cascode_ota">Folded-cascode OTA · 증폭기</option>
+                  <option value="common_source_amp">Common-source amplifier</option>
+                  <option value="tia">Transimpedance amplifier</option>
+                  <option value="active_rc_filter">Active-RC filter</option>
+                  <option value="current_mirror">Precision current mirror</option>
+                  </optgroup>
+                  <optgroup label="전원 · 레퍼런스 · 클록">
                   <option value="ldo">LDO · 전원 관리</option>
+                  <option value="bandgap_reference">Bandgap reference</option>
+                  <option value="charge_pump">Charge pump</option>
+                  <option value="buck_converter">Buck converter control</option>
+                  <option value="ring_oscillator">Ring oscillator</option>
+                  <option value="pll">Charge-pump PLL</option>
+                  </optgroup>
+                  <optgroup label="데이터 컨버터 · 혼성신호">
                   <option value="sar_adc">8-bit SAR ADC · 혼성신호</option>
+                  <option value="dynamic_comparator">Dynamic comparator</option>
+                  <option value="delta_sigma_adc">Delta-sigma ADC modulator</option>
+                  </optgroup>
                 </select>
               </label>
               <div class="field-row">
@@ -221,7 +241,7 @@
                   <span class="kicker">04 · AGENT ORCHESTRATION</span>
                   <h2>설계 그래프</h2>
                 </div>
-                <span class="iteration-pill" id="iteration-pill">0 mock evaluation records</span>
+                <span class="iteration-pill" id="iteration-pill">0 optimization records</span>
               </div>
               <div class="pipeline" id="agent-pipeline" aria-live="polite"></div>
               <div class="planner-note">

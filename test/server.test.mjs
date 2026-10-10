@@ -3,6 +3,10 @@ import test from 'node:test';
 import { Readable } from 'node:stream';
 import { createApp, normalizeInput, runDesignCycle } from '../server.mjs';
 
+// Unit tests deliberately bypass paid network agents; production defaults to
+// FUSION_REQUIRE_LLM=true and refuses a deterministic design-only run.
+process.env.FUSION_REQUIRE_LLM = 'false';
+
 function requestApp(app, method, url, body) {
   return new Promise((resolve) => {
     const request = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : []);
@@ -59,7 +63,8 @@ test('runs a constrained OTA design cycle with verifiable artifacts', async () =
   assert.match(result.testbench, /\.ac dec/);
   assert.equal(result.verification.templateConstrained, true);
   assert.equal(result.verification.exportAllowed, true);
-  assert.equal(result.retrieval.mode, 'local markdown lexical retrieval');
+  assert.equal(result.retrieval.mode, 'local GraphRAG (evidence graph traversal)');
+  assert.ok(result.retrieval.graph.graphStats.nodes > 0);
   assert.equal(result.sources.length, 5);
   assert.equal(result.search.algorithm, 'LM-prior PUCT MCTS + structured-token p-filter');
   assert.equal(result.topology.bipartiteMatrix.valid, true);
