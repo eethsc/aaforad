@@ -105,7 +105,13 @@
               </div>
 
               <label class="field">
-                <span>회로 목표</span>
+                <span>자연어 설계 요청 · 데이터시트 사양 포함</span>
+                <textarea name="naturalRequest" rows="5" placeholder="예: Sky130에서 1.8 V로 동작하는 저전력 TIA를 설계해줘. DC gain ≥ 60 dB, UGBW ≥ 25 MHz, phase margin ≥ 60°, power ≤ 1.2 mW, input-referred noise ≤ 30 nV/√Hz, settling time ≤ 200 ns를 만족해야 해."></textarea>
+                <small>입력하면 AI가 회로군과 모든 검증 사양을 추출합니다. 매핑할 수 없는 사양은 export를 차단합니다.</small>
+              </label>
+
+              <label class="field">
+                <span>회로 목표 · 선택 입력</span>
                 <select name="circuit" id="circuit-input">
                   <option value="auto">AI Auto-select · GraphRAG 기반 선택</option>
                   <optgroup label="증폭기 · 인터페이스">

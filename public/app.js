@@ -202,11 +202,12 @@ function renderVerification(result) {
       + '<span>' + escapeHtml(constraint.oracle) + '</span></div>'
       + '</article>'
   )).join('');
-  const pdgContent = result.pdg.map((step, index) => (
-    '<span class="pdg-step">' + (index + 1) + '. ' + escapeHtml(step.id.replace(/_/g, ' ')) + '</span>'
-      + (index < result.pdg.length - 1 ? '<span class="pdg-arrow">→</span>' : '')
+  const pdgContent = result.pdg.topologicalOrder.map((id, index) => (
+    '<span class="pdg-step">' + (index + 1) + '. ' + escapeHtml(id.replace(/_/g, ' ')) + '</span>'
+      + (index < result.pdg.topologicalOrder.length - 1 ? '<span class="pdg-arrow">→</span>' : '')
   )).join('');
-  target('#pdg-flow').innerHTML = '<span class="pdg-title">PDG ORDER</span>' + pdgContent;
+  const coverage = result.specCoverage;
+  target('#pdg-flow').innerHTML = '<span class="pdg-title">PDG ORDER · ' + coverage.mapped + '/' + coverage.total + ' specs mapped</span>' + pdgContent;
   const verificationPass = result.verification.exportAllowed;
   const badge = target('#verification-status');
   badge.textContent = verificationPass ? 'ALL CHECKS PASS' : 'REVIEW REQUIRED';
@@ -436,6 +437,11 @@ target('#circuit-input').addEventListener('change', () => {
   if (circuit === 'sar_adc') {
     showToast('SAR ADC는 검증된 서브블록 템플릿에서만 구성됩니다.');
   }
+});
+
+target('[name="naturalRequest"]').addEventListener('input', (event) => {
+  if (event.target.value.trim().length > 0) target('#circuit-input').value = 'auto';
+  updateCircuitLabels();
 });
 
 updateCircuitLabels();

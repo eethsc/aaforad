@@ -294,8 +294,79 @@ export function normalizeInput(input = {}) {
     powerTarget: numberInRange(input.powerTarget, DEFAULT_INPUT.powerTarget, 0.01, 1000),
     noiseTarget: numberInRange(input.noiseTarget, DEFAULT_INPUT.noiseTarget, 1, 1000),
     searchBudget: Math.round(numberInRange(input.searchBudget, DEFAULT_INPUT.searchBudget, 8, 256)),
-    prompt: compactText(input.prompt, DEFAULT_INPUT.prompt, 600)
+    prompt: compactText(input.prompt, DEFAULT_INPUT.prompt, 600),
+    naturalRequest: compactText(input.naturalRequest, '', 6000)
   };
+}
+
+function mergeExtractedSpec(spec, extracted = {}) {
+  const aliases = ['supply', 'gainTarget', 'ugbwTarget', 'phaseTarget', 'powerTarget', 'noiseTarget', 'searchBudget'];
+  const merged = { ...spec };
+  for (const field of aliases) {
+    if (Object.hasOwn(extracted, field)) merged[field] = numberInRange(extracted[field], spec[field], field === 'supply' ? 0.6 : 0.01, field === 'searchBudget' ? 256 : 10000);
+  }
+  if (typeof extracted.process === 'string') merged.process = compactText(extracted.process, spec.process, 80);
+  return merged;
+}
+
+const LEDGER_METRICS = new Map([
+  ['gain', 'gain'], ['dc_gain', 'gain'], ['이득', 'gain'],
+  ['ugbw', 'ugbw'], ['bandwidth', 'ugbw'], ['대역폭', 'ugbw'],
+  ['phase', 'phase'], ['phase_margin', 'phase'], ['위상', 'phase'],
+  ['power', 'power'], ['전력', 'power'], ['consumption', 'power'],
+  ['noise', 'noise'], ['잡음', 'noise']
+  ,['input_referred_noise', 'noise'], ['input-referred_noise', 'noise']
+  ,['settling', 'settling'], ['settling_time', 'settling'], ['정착시간', 'settling']
+  ,['supply_voltage', 'supply'], ['vdd', 'supply'], ['전원전압', 'supply']
+]);
+
+function defaultSpecLedger(spec) {
+  return [
+    { id: 'gain', metric: 'gain', operator: '>=', value: spec.gainTarget, unit: 'dB', testType: 'ac' },
+    { id: 'ugbw', metric: 'ugbw', operator: '>=', value: spec.ugbwTarget, unit: 'MHz', testType: 'ac' },
+    { id: 'phase', metric: 'phase', operator: '>=', value: spec.phaseTarget, unit: 'deg', testType: 'ac' },
+    { id: 'power', metric: 'power', operator: '<=', value: spec.powerTarget, unit: 'mW', testType: 'op' },
+    { id: 'noise', metric: 'noise', operator: '<=', value: spec.noiseTarget, unit: 'nV/√Hz', testType: 'noise' }
+  ];
+}
+
+function buildSpecLedger(spec, llmLedger, naturalRequest) {
+  const ledger = new Map(defaultSpecLedger(spec).map((item) => [item.metric, item]));
+  for (const item of Array.isArray(llmLedger) ? llmLedger : []) {
+    const normalized = String(item?.metric || '').toLowerCase().replace(/[\s-]+/g, '_');
+    const metric = LEDGER_METRICS.get(normalized);
+    if (metric) {
+      const prior = ledger.get(metric) || { id: metric, metric, operator: '>=', value: Number(item.value) || 0, unit: '', testType: 'manual' };
+      ledger.set(metric, {
+      ...prior,
+      operator: item.operator === '<=' ? '<=' : '>=',
+      value: Number.isFinite(Number(item.value)) ? Number(item.value) : prior.value,
+      unit: compactText(item.unit, prior.unit, 40),
+      testType: compactText(item.testType, prior.testType, 30),
+      source: 'LLM extracted'
+    });
+    }
+    else if (item?.metric) ledger.set('unmapped_' + ledger.size, {
+      id: 'unmapped_' + ledger.size,
+      metric: compactText(item.metric, 'unmapped', 80),
+      operator: item.operator === '<=' ? '<=' : '>=',
+      value: Number(item.value) || 0,
+      unit: compactText(item.unit, '', 40),
+      testType: compactText(item.testType, 'manual', 30),
+      source: 'LLM extracted; no deterministic oracle mapping',
+      unmapped: true
+    });
+  }
+  // Every numeric engineering clause in a natural request must appear in the
+  // ledger. Unknown clauses are deliberately fail-closed rather than dropped.
+  const clauses = (naturalRequest.match(/[^\n.;,]{0,48}\d+(?:\.\d+)?\s*(?:dB|MHz|GHz|mW|uW|nW|V|mV|ns|us|ps|%|°|deg)[^\n.;,]{0,48}/gi) || []);
+  for (const clause of clauses) {
+    const known = [...LEDGER_METRICS.keys()].some((term) => clause.toLowerCase().includes(term));
+    if (!known && !/\b(?:vdd|supply)\b/i.test(clause)) ledger.set('unmapped_clause_' + ledger.size, {
+      id: 'unmapped_clause_' + ledger.size, metric: 'unmapped specification clause', operator: '>=', value: 0, unit: '', testType: 'manual', source: clause.trim(), unmapped: true
+    });
+  }
+  return [...ledger.values()];
 }
 
 function stableFraction(seed, label) {
@@ -574,6 +645,53 @@ function makeConstraints(template, spec, metrics) {
   return items;
 }
 
+function applySpecCoverage(constraints, ledger, metrics, spec) {
+  const byId = new Map(constraints.map((item) => [item.id, item]));
+  const coverage = ledger.map((item) => {
+    const constraint = byId.get(item.metric);
+    const binding = {
+      gain: { actual: metrics.gain, unit: 'dB' },
+      ugbw: { actual: metrics.ugbw, unit: 'MHz' },
+      phase: { actual: metrics.phase, unit: 'deg' },
+      power: { actual: metrics.power, unit: 'mW' },
+      noise: { actual: metrics.noise, unit: 'nV/√Hz' },
+      // Analytical settling is expressed in µs; PDG transient assertions use ns.
+      settling: { actual: Number.isFinite(metrics.settling) ? metrics.settling * 1000 : null, unit: 'ns' },
+      supply: { actual: spec.supply, unit: 'V' }
+    }[item.metric];
+    if (constraint || binding) {
+      const actual = binding?.actual;
+      const passed = Number.isFinite(actual)
+        ? (item.operator === '<=' ? actual <= item.value : actual >= item.value)
+        : constraint?.passed;
+      return {
+        ...(constraint || {}),
+        id: item.metric,
+        ledgerId: item.id,
+        label: constraint?.label || item.metric,
+        target: item.operator + ' ' + item.value + ' ' + item.unit,
+        actual: Number.isFinite(actual) ? round(actual, 3) + ' ' + (binding?.unit || item.unit) : constraint?.actual,
+        passed: Boolean(passed),
+        coverage: 'verified',
+        source: item.source || 'structured spec'
+      };
+    }
+    return {
+      id: item.id,
+      ledgerId: item.id,
+      label: item.metric,
+      target: item.operator + ' ' + item.value + (item.unit ? ' ' + item.unit : ''),
+      actual: 'no deterministic oracle / testbench mapping',
+      passed: false,
+      coverage: 'unmapped',
+      oracle: 'missing verification mapping',
+      source: item.source || 'structured spec'
+    };
+  });
+  const covered = new Set(coverage.filter((item) => item.coverage === 'verified').map((item) => item.id));
+  return constraints.filter((item) => !['gain', 'ugbw', 'phase', 'power', 'noise'].includes(item.id) || !covered.has(item.id)).concat(coverage);
+}
+
 function violationScore(constraints) {
   return round(constraints.reduce((score, constraint) => score + (constraint.passed ? 0 : 1), 0), 2);
 }
@@ -606,14 +724,14 @@ function repairSizingAction(template, action, constraints) {
   return repaired;
 }
 
-function runAgenticSizingCycle(template, spec, seed, selectedCandidate, plannerAction) {
+function runAgenticSizingCycle(template, spec, seed, selectedCandidate, plannerAction, specLedger = defaultSpecLedger(spec)) {
   const baselineAction = {
     ...plannerAction,
     deviceScale: clamp((Number(plannerAction.deviceScale) || 1) * 0.92, 0.8, 1.25),
     compensationScale: clamp((Number(plannerAction.compensationScale) || 1) * 0.92, 0.8, 1.3)
   };
   const baselineMetrics = estimateMetrics(template, spec, seed, selectedCandidate, baselineAction);
-  const baselineConstraints = makeConstraints(template, spec, baselineMetrics);
+  const baselineConstraints = applySpecCoverage(makeConstraints(template, spec, baselineMetrics), specLedger, baselineMetrics, spec);
   // ATLAS Stage 3: ParEGO makes the trade-off search, while AgenticSizing's
   // planner owns the role tag and only its two permitted scale variables move.
   const optimization = runParEgo({
@@ -627,7 +745,7 @@ function runAgenticSizingCycle(template, spec, seed, selectedCandidate, plannerA
         compensationScale: round(compensationScale, 4)
       };
       const metrics = estimateMetrics(template, spec, seed, selectedCandidate, candidateAction);
-      const constraints = makeConstraints(template, spec, metrics);
+      const constraints = applySpecCoverage(makeConstraints(template, spec, metrics), specLedger, metrics, spec);
       const gainLoss = Math.max(0, spec.gainTarget - metrics.gain) / Math.max(1, spec.gainTarget);
       const speedLoss = Math.max(0, spec.ugbwTarget - metrics.ugbw) / Math.max(1, spec.ugbwTarget);
       const phaseLoss = Math.max(0, spec.phaseTarget - metrics.phase) / Math.max(1, spec.phaseTarget);
@@ -658,7 +776,7 @@ function runAgenticSizingCycle(template, spec, seed, selectedCandidate, plannerA
     repair.attempted = true;
     const repairedAction = repairSizingAction(template, finalAction, constraints);
     const repairedMetrics = estimateMetrics(template, spec, seed, selectedCandidate, repairedAction);
-    const repairedConstraints = makeConstraints(template, spec, repairedMetrics);
+    const repairedConstraints = applySpecCoverage(makeConstraints(template, spec, repairedMetrics), specLedger, repairedMetrics, spec);
     records.push(makeIterationRecord(records.length, repairedConstraints, 'PDG-guided closed-loop repair'));
     if (violationScore(repairedConstraints) < violationScore(constraints)) {
       finalAction = repairedAction;
@@ -768,15 +886,53 @@ function makeTestbench(template, spec) {
   return common.join('\n');
 }
 
-function makePdg(template) {
-  const order = template.id === 'sar_adc'
-    ? ['reset', 'sample', 'hold', 'dac_switch', 'compare', 'sar_update', 'assert']
-    : ['bias_settle', 'input_stimulus', 'operating_point', 'ac_sweep', 'transient', 'assert'];
-  return order.map((name, index) => ({
-    id: name,
-    index: index + 1,
-    dependsOn: index === 0 ? [] : [order[index - 1]]
+function makePdg(template, ledger = []) {
+  const nodes = [
+    { id: 'power_up', kind: 'stimulus', dependsOn: [], ports: ['vdd', 'gnd'] },
+    { id: 'bias_settle', kind: 'settle', dependsOn: ['power_up'], ports: ['vdd', 'gnd'] }
+  ];
+  const roleTasks = template.roles.map(([role]) => ({
+    id: 'role_' + role,
+    kind: 'substructure_settle',
+    dependsOn: ['bias_settle'],
+    ports: template.nodes.filter((node) => node.kind !== 'ground').map((node) => node.id),
+    role
   }));
+  nodes.push(...roleTasks);
+  const roleDependencies = roleTasks.map((node) => node.id);
+  const testNodes = new Map();
+  for (const item of ledger) {
+    const testType = item.testType || 'manual';
+    const testId = 'test_' + testType.replace(/[^a-z0-9_]/gi, '_');
+    if (!testNodes.has(testId)) {
+      const dependsOn = testType === 'ac' ? roleDependencies.concat(['bias_settle'])
+        : testType === 'noise' ? roleDependencies.concat(['bias_settle'])
+          : testType === 'transient' ? roleDependencies.concat(['bias_settle'])
+            : testType === 'op' ? ['bias_settle'] : roleDependencies;
+      testNodes.set(testId, { id: testId, kind: 'analysis', analysis: testType, dependsOn, ports: ['in', 'out', 'vdd', 'gnd'] });
+    }
+    nodes.push({ id: 'assert_' + item.id, kind: 'assertion', metric: item.metric, ledgerId: item.id, dependsOn: [testId], ports: ['out'] });
+  }
+  nodes.splice(2 + roleTasks.length, 0, ...testNodes.values());
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const indegree = new Map(nodes.map((node) => [node.id, node.dependsOn.length]));
+  const ready = nodes.filter((node) => indegree.get(node.id) === 0).map((node) => node.id);
+  const order = [];
+  while (ready.length) {
+    const id = ready.shift();
+    order.push(id);
+    for (const node of nodes.filter((candidate) => candidate.dependsOn.includes(id))) {
+      indegree.set(node.id, indegree.get(node.id) - 1);
+      if (indegree.get(node.id) === 0) ready.push(node.id);
+    }
+  }
+  return {
+    nodes: nodes.map((node, index) => ({ ...node, index: index + 1 })),
+    edges: nodes.flatMap((node) => node.dependsOn.map((from) => ({ from, to: node.id, type: 'depends-on' }))),
+    topologicalOrder: order,
+    valid: order.length === nodes.length && [...byId.keys()].every((id) => byId.has(id)),
+    coverage: ledger.map((item) => ({ ledgerId: item.id, assertion: 'assert_' + item.id, test: 'test_' + (item.testType || 'manual').replace(/[^a-z0-9_]/gi, '_') }))
+  };
 }
 
 function buildTopology(template) {
@@ -987,7 +1143,7 @@ async function runOpenRouterArchitecture(spec, template, knowledge) {
   const result = await callOpenRouterAgent({
     name: 'Architect',
     system: 'You are the Architect in an analog-circuit agent team. Use only GraphRAG evidence supplied by the server. Choose a constrained circuit family, never invent a SPICE netlist.',
-    prompt: `Specification: ${JSON.stringify(spec)}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\nGraphRAG evidence: ${graphContext(knowledge)}\nReturn JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."]}.`,
+    prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
     schema: 'architecture-v1'
   });
   const selected = TEMPLATE_LIBRARY[result.output.circuit] || template;
@@ -1064,7 +1220,8 @@ export async function runDesignCycle(rawInput = {}) {
     ? await runOpenRouterArchitecture(spec, requestedTemplate, initialKnowledge)
     : { name: 'Architect', output: { circuit: requestedTemplate.id, rationale: 'test-only deterministic bypass' }, selectedTemplate: requestedTemplate };
   const template = architecture.selectedTemplate;
-  const effectiveSpec = { ...spec, circuit: template.id };
+  const effectiveSpec = { ...mergeExtractedSpec(spec, architecture.output.extractedSpec), circuit: template.id };
+  const specificationLedger = buildSpecLedger(effectiveSpec, architecture.output.specificationLedger, spec.naturalRequest);
   const knowledge = retrieveKnowledge(effectiveSpec, template);
   const fallbackPlan = makePlannerFallback(template, effectiveSpec);
   const planner = llmRequired()
@@ -1073,7 +1230,7 @@ export async function runDesignCycle(rawInput = {}) {
   const topologySearch = buildCandidates(template, effectiveSpec, cacheKey, planner.action);
   const candidates = topologySearch.candidates;
   const selected = candidates.find((candidate) => candidate.status === 'selected') || candidates[0];
-  let sizing = runAgenticSizingCycle(template, effectiveSpec, cacheKey, selected, planner.action);
+  let sizing = runAgenticSizingCycle(template, effectiveSpec, cacheKey, selected, planner.action, specificationLedger);
   const critic = llmRequired()
     ? await runOpenRouterCritic(effectiveSpec, template, knowledge, sizing, planner)
     : { name: 'Critic', output: { verdict: 'pass', reason: 'test-only deterministic bypass' } };
@@ -1084,11 +1241,11 @@ export async function runDesignCycle(rawInput = {}) {
       deviceScale: clamp(planner.action.deviceScale + clamp(Number(critic.output.deviceDelta) || 0, -0.12, 0.12), 0.8, 1.25),
       compensationScale: clamp(planner.action.compensationScale + clamp(Number(critic.output.compensationDelta) || 0, -0.12, 0.12), 0.8, 1.3)
     }, template);
-    const revised = runAgenticSizingCycle(template, effectiveSpec, cacheKey + ':critic', selected, revisedAction);
+    const revised = runAgenticSizingCycle(template, effectiveSpec, cacheKey + ':critic', selected, revisedAction, specificationLedger);
     if (violationScore(revised.constraints) <= violationScore(sizing.constraints)) sizing = revised;
   }
   const symbolicOracle = await evaluateSymbolicOracle({ metrics: sizing.metrics, spec: effectiveSpec });
-  const pdg = makePdg(template);
+  const pdg = makePdg(template, specificationLedger);
   const verifier = llmRequired()
     ? await runOpenRouterVerifier(effectiveSpec, template, symbolicOracle, sizing.constraints, pdg)
     : { name: 'Verifier', output: { llmVerdict: 'pass', riskSummary: 'test-only deterministic bypass', testIntent: [] } };
@@ -1129,6 +1286,13 @@ export async function runDesignCycle(rawInput = {}) {
     variables: sizing.variables,
     metrics: sizing.metrics,
     constraints: sizing.constraints,
+    specificationLedger,
+    specCoverage: {
+      total: specificationLedger.length,
+      mapped: specificationLedger.filter((item) => !item.unmapped).length,
+      unmapped: specificationLedger.filter((item) => item.unmapped).length,
+      complete: specificationLedger.every((item) => !item.unmapped)
+    },
     iterationHistory: sizing.iterationHistory,
     optimization: sizing.optimization,
     roleKnowledge: sizing.roleKnowledge,
@@ -1145,7 +1309,7 @@ export async function runDesignCycle(rawInput = {}) {
       topologyValid: true,
       templateConstrained: true,
       numericalOracleEvaluated: symbolicOracle.available && symbolicOracle.allPassed,
-      pdgValid: true,
+      pdgValid: pdg.valid,
       allConstraintsPass: exportsAllowed,
       exportAllowed: exportsAllowed,
       repair: sizing.repair
