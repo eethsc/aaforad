@@ -2,6 +2,7 @@
 .DS_Store
 node_modules/
 coverage/
+*.log
 
 # Local paper corpus; source citations remain in the Markdown report.
 *.pdf

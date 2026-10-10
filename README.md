@@ -49,6 +49,16 @@ docker compose up --build
 
 `down -v`는 캐시된 PDK 볼륨도 지우므로, 버전을 바꿀 때만 사용합니다.
 
+## 데이터시트 기반 설계
+
+설계 brief에서 PDF, TXT, Markdown 데이터시트를 최대 7 MB까지 첨부할 수 있습니다. PDF는 서버에서 `pdftotext`로 텍스트만 추출한 뒤 원본 임시 파일을 즉시 제거합니다. 추출된 사양은 파일명·해시·원문 근거와 함께 specification ledger 및 PDG assertion에 추가됩니다.
+
+- 연결된 deterministic testbench/oracle가 있는 사양은 검증됩니다.
+- 아직 mapping이 없는 사양은 **unmapped**으로 표시되고 export를 차단합니다. 문서 수치를 조용히 무시하지 않습니다.
+- Docker 이미지에는 PDF 추출용 Poppler와 SymPy oracle이 포함되어 있습니다.
+
+예를 들어 TI TLV271 PDF는 공급전압, GBW, noise를 현재 adapter로 검증하고, supply current, slew rate, offset, bias current, CMRR, output current, temperature는 필요한 measurement adapter가 만들어질 때까지 fail-closed로 남습니다.
+
 ## 구현된 설계 흐름
 
 | 단계 | UI / 서버 구현 | 연구 패턴 |

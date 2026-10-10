@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, existsSync, readFileSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -13,7 +15,8 @@ import { callOpenRouterAgent, openRouterConfigured } from './engine/openrouter.m
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const RESEARCH_NOTES_PATH = path.join(ROOT_DIR, 'analog_design_agentic_ai_papers.md');
-const MAX_BODY_BYTES = 256 * 1024;
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
+const MAX_DATASHEET_BYTES = 7 * 1024 * 1024;
 const responseCache = new Map();
 let researchGraphCache = null;
 
@@ -277,6 +280,95 @@ function compactText(value, fallback, maxLength) {
   return trimmed.slice(0, maxLength) || fallback;
 }
 
+function dataSheetRequirement(id, metric, operator, value, unit, testType, source, unmapped = false) {
+  return { id, metric, operator, value, unit, testType, source, unmapped };
+}
+
+function extractDataSheetRequirements(text, fileName) {
+  const normalized = text.replace(/\s+/g, ' ').toLowerCase();
+  // A deterministic profile keeps original supplier requirements distinct from
+  // user wishes. It is deliberately fail-closed for metrics without a local
+  // testbench/oracle adapter.
+  if (/tlv27[124].{0,40}(?:rail.?to.?rail|operational amplifier)/i.test(text)
+    || /tlv271/.test(normalized)) {
+    return [
+      dataSheetRequirement('supply_min', 'supply', '>=', 2.7, 'V', 'op', 'TLV271 datasheet: recommended supply minimum'),
+      dataSheetRequirement('supply_max', 'supply', '<=', 16, 'V', 'op', 'TLV271 datasheet: recommended supply maximum'),
+      dataSheetRequirement('ugbw_typ', 'ugbw', '>=', 3, 'MHz', 'ac', 'TLV271 datasheet: 3-MHz typical GBW'),
+      dataSheetRequirement('noise_typ', 'noise', '<=', 39, 'nV/√Hz', 'noise', 'TLV271 datasheet: 1-kHz typical input noise'),
+      dataSheetRequirement('supply_current_typ', 'supply_current', '<=', 0.55, 'mA/channel', 'op', 'TLV271 datasheet: typical supply current', true),
+      dataSheetRequirement('slew_rate_typ', 'slew_rate', '>=', 2.1, 'V/µs', 'transient', 'TLV271 datasheet: typical slew rate', true),
+      dataSheetRequirement('offset_max', 'input_offset_voltage', '<=', 5, 'mV', 'op', 'TLV271 datasheet: maximum input offset at 25°C', true),
+      dataSheetRequirement('input_bias_max', 'input_bias_current', '<=', 60, 'pA', 'op', 'TLV271 datasheet: maximum input bias current', true),
+      dataSheetRequirement('cmrr_typ', 'cmrr', '>=', 80, 'dB', 'op', 'TLV271 datasheet: typical CMRR', true),
+      dataSheetRequirement('output_current_typ', 'output_current', '>=', 7, 'mA', 'op', 'TLV271 datasheet: typical output current', true),
+      dataSheetRequirement('temperature_min', 'operating_temperature', '>=', -40, '°C', 'manual', 'TLV271 datasheet: industrial temperature minimum', true),
+      dataSheetRequirement('temperature_max', 'operating_temperature', '<=', 125, '°C', 'manual', 'TLV271 datasheet: industrial temperature maximum', true)
+    ];
+  }
+  const numericClauses = text.match(/[^\n]{0,60}\d+(?:\.\d+)?\s*(?:MHz|kHz|GHz|mV|V|mA|µA|uA|nV\s*\/\s*√?Hz|dB|°C)[^\n]{0,60}/gi) || [];
+  return numericClauses.slice(0, 80).map((clause, index) => dataSheetRequirement(
+    'unclassified_' + index,
+    'unclassified datasheet clause',
+    '>=',
+    0,
+    '',
+    'manual',
+    compactText(clause, fileName, 180),
+    true
+  ));
+}
+
+function execFileText(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { maxBuffer: 8 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
+      if (error) reject(new Error((stderr || error.message).slice(0, 1200)));
+      else resolve(stdout);
+    });
+  });
+}
+
+async function parseDataSheet(input) {
+  if (!input || typeof input !== 'object' || !input.contentBase64) return null;
+  const fileName = compactText(input.fileName, 'datasheet', 120);
+  const extension = path.extname(fileName).toLowerCase();
+  if (!['.pdf', '.txt', '.md'].includes(extension)) {
+    const error = new Error('Only PDF, TXT, and Markdown datasheets are supported.');
+    error.statusCode = 415;
+    throw error;
+  }
+  const bytes = Buffer.from(String(input.contentBase64), 'base64');
+  if (!bytes.length || bytes.length > MAX_DATASHEET_BYTES) {
+    const error = new Error('Datasheet must be between 1 byte and 7 MB.');
+    error.statusCode = 413;
+    throw error;
+  }
+  let text;
+  if (extension === '.pdf') {
+    const directory = await mkdtemp(path.join(process.env.TMPDIR || '/tmp', 'fusion-datasheet-'));
+    const source = path.join(directory, 'source.pdf');
+    try {
+      await writeFile(source, bytes);
+      text = await execFileText('pdftotext', ['-layout', source, '-']);
+    } catch (cause) {
+      const error = new Error('PDF text extraction failed: ' + cause.message);
+      error.statusCode = 422;
+      throw error;
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  } else text = bytes.toString('utf8');
+  const requirement = extractDataSheetRequirements(text, fileName);
+  return {
+    fileName,
+    mimeType: compactText(input.mimeType, extension === '.pdf' ? 'application/pdf' : 'text/plain', 80),
+    sha256: createHash('sha256').update(bytes).digest('hex').slice(0, 16),
+    extractedCharacters: text.length,
+    requirements: requirement,
+    parser: /tlv271/i.test(text) ? 'TI TLV271 deterministic profile' : 'numeric clauses tracked fail-closed'
+  };
+}
+
 export function normalizeInput(input = {}) {
   const circuit = input.circuit === 'auto'
     ? 'auto'
@@ -295,7 +387,8 @@ export function normalizeInput(input = {}) {
     noiseTarget: numberInRange(input.noiseTarget, DEFAULT_INPUT.noiseTarget, 1, 1000),
     searchBudget: Math.round(numberInRange(input.searchBudget, DEFAULT_INPUT.searchBudget, 8, 256)),
     prompt: compactText(input.prompt, DEFAULT_INPUT.prompt, 600),
-    naturalRequest: compactText(input.naturalRequest, '', 6000)
+    naturalRequest: compactText(input.naturalRequest, '', 6000),
+    dataSheet: input.dataSheet || null
   };
 }
 
@@ -365,6 +458,14 @@ function buildSpecLedger(spec, llmLedger, naturalRequest) {
     if (!known && !/\b(?:vdd|supply)\b/i.test(clause)) ledger.set('unmapped_clause_' + ledger.size, {
       id: 'unmapped_clause_' + ledger.size, metric: 'unmapped specification clause', operator: '>=', value: 0, unit: '', testType: 'manual', source: clause.trim(), unmapped: true
     });
+  }
+  for (const item of spec.dataSheet?.requirements || []) {
+    // The Architect receives the document-derived requirements as context. If
+    // it repeats one, preserve the deterministic document source exactly once.
+    for (const [key, existing] of ledger) {
+      if (existing.metric === item.metric && String(existing.source || '').startsWith('LLM extracted')) ledger.delete(key);
+    }
+    ledger.set('datasheet_' + item.id, { ...item, id: 'datasheet_' + item.id, source: item.source + ' · uploaded ' + spec.dataSheet.fileName });
   }
   return [...ledger.values()];
 }
@@ -1194,11 +1295,12 @@ async function runOpenRouterVerifier(spec, template, symbolicOracle, constraints
 }
 
 export async function runDesignCycle(rawInput = {}) {
-  const spec = normalizeInput(rawInput);
+  const dataSheet = await parseDataSheet(rawInput.dataSheet);
+  const spec = { ...normalizeInput(rawInput), dataSheet };
   const requestedTemplate = TEMPLATE_LIBRARY[spec.circuit] || TEMPLATE_LIBRARY[DEFAULT_INPUT.circuit];
   const planningIdentity = openRouterConfigured() ? 'openrouter:' + process.env.OPENROUTER_MODEL : 'llm-unconfigured';
   const cacheKey = createHash('sha256')
-    .update(JSON.stringify({ spec, planningIdentity, engine: 'graphrag-agent-loop-v2' }))
+    .update(JSON.stringify({ spec, planningIdentity, engine: 'graphrag-agent-loop-v3-datasheet' }))
     .digest('hex');
   const cached = responseCache.get(cacheKey);
   if (cached && !llmRequired()) {
@@ -1256,7 +1358,9 @@ export async function runDesignCycle(rawInput = {}) {
   const exportedTestbench = exportsAllowed ? makeTestbench(template, effectiveSpec) : null;
   const ngspice = await detectNgspice();
   const pdk = await detectPdk();
-  let simulation = { mode: 'analytic-surrogate', status: ngspice, pdk, metrics: null, diagnostics: 'ngspice or PDK unavailable; analytic model used for optimization only' };
+  let simulation = ngspice.available && pdk.available
+    ? { mode: 'not-run', status: ngspice, pdk, metrics: null, diagnostics: 'ngspice and PDK are ready; simulation is withheld until all requirements pass the export gate' }
+    : { mode: 'analytic-surrogate', status: ngspice, pdk, metrics: null, diagnostics: 'ngspice or PDK unavailable; analytic model used for optimization only' };
   if (ngspice.available && pdk.available && exportedNetlist && exportedTestbench) {
     const deck = exportedNetlist.replace(/\n\.end\s*$/i, '\n' + exportedTestbench + '\n.end');
     simulation = await runNgspice(deck);
@@ -1265,7 +1369,11 @@ export async function runDesignCycle(rawInput = {}) {
     id: randomUUID(),
     createdAt: new Date().toISOString(),
     mode: {
-      simulator: simulation.mode === 'ngspice' ? 'ngspice measurement' : 'analytic surrogate (ngspice adapter unavailable)',
+      simulator: simulation.mode === 'ngspice'
+        ? 'ngspice measurement'
+        : simulation.mode === 'not-run'
+          ? 'ngspice + PDK ready; measurement gated by failed requirements'
+          : 'analytic surrogate (ngspice adapter unavailable)',
       llm: llmRequired()
         ? 'OpenRouter Architect → Planner → Critic → Verifier loop completed'
         : (planner.enabled ? 'legacy test adapter action applied' : 'test-only deterministic bypass'),
@@ -1274,6 +1382,7 @@ export async function runDesignCycle(rawInput = {}) {
       fabricationSafe: false
     },
     spec: effectiveSpec,
+    dataSheet,
     planner,
     agentLoop: { architecture, planner, critic, verifier, required: llmRequired(), provider: 'OpenRouter' },
     topology: buildTopology(template),

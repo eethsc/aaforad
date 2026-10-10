@@ -2,7 +2,9 @@ const state = {
   result: null,
   artifact: 'netlist',
   running: false,
-  toastTimer: null
+  toastTimer: null,
+  dataSheet: null,
+  sessionId: globalThis.crypto?.randomUUID?.() || String(Date.now())
 };
 
 const form = document.querySelector('#spec-form');
@@ -45,9 +47,27 @@ function showToast(message) {
   state.toastTimer = window.setTimeout(() => toast.classList.remove('show'), 3200);
 }
 
-function formPayload() {
+async function fileAsBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = '';
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function formPayload() {
   const values = new FormData(form);
-  return Object.fromEntries(values.entries());
+  const payload = Object.fromEntries(values.entries());
+  delete payload.dataSheet;
+  if (state.dataSheet) {
+    payload.dataSheet = {
+      fileName: state.dataSheet.name,
+      mimeType: state.dataSheet.type,
+      contentBase64: await fileAsBase64(state.dataSheet)
+    };
+  }
+  return payload;
 }
 
 function updateCircuitLabels() {
@@ -302,6 +322,31 @@ function renderAll(result) {
   renderSources(result.sources, result.retrieval);
   renderArtifact();
   target('#session-meta').textContent = result.mode.llm;
+  target('#session-title').textContent = result.dataSheet
+    ? result.dataSheet.fileName.replace(/\.[^.]+$/, '')
+    : result.topology.shortLabel + ' · ' + result.topology.family;
+  if (result.dataSheet) {
+    const status = target('#datasheet-status');
+    status.textContent = result.dataSheet.fileName + ' · ' + result.dataSheet.requirements.length
+      + '개 사양 추출 · ' + result.dataSheet.parser + ' · hash ' + result.dataSheet.sha256;
+    status.className = 'ready';
+  }
+}
+
+function clearResults() {
+  target('#metrics-grid').innerHTML = Array.from({ length: 5 }, () => '<div class="metric-card skeleton-card"></div>').join('');
+  target('#candidate-list').innerHTML = '';
+  target('#constraint-list').innerHTML = '';
+  target('#pdg-flow').innerHTML = '';
+  target('#chart-wrap').innerHTML = '';
+  target('#agent-pipeline').innerHTML = '';
+  target('#artifact-code').textContent = '실행 후 템플릿 제약 넷리스트가 이곳에 표시됩니다.';
+  target('#download-netlist-button').disabled = false;
+  target('#cache-label').innerHTML = '<span>◌</span> 아직 실행되지 않음';
+  target('#iteration-pill').textContent = '0 optimization records';
+  target('#verification-status').textContent = '대기';
+  target('#verification-status').classList.remove('pass');
+  target('#repair-callout').className = 'repair-callout';
 }
 
 function startRunAnimation() {
@@ -325,7 +370,7 @@ async function runDesign(event) {
     const request = fetchJson('/api/agent/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(formPayload())
+      body: JSON.stringify(await formPayload())
     });
     const results = await Promise.all([request, pause(540)]);
     renderAll(results[0]);
@@ -415,11 +460,40 @@ target('#fit-circuit-button').addEventListener('click', () => {
 
 target('#new-session-button').addEventListener('click', () => {
   form.reset();
+  state.sessionId = globalThis.crypto?.randomUUID?.() || String(Date.now());
+  state.dataSheet = null;
   updateCircuitLabels();
   state.result = null;
+  state.artifact = 'netlist';
+  target('#datasheet-input').value = '';
+  target('#datasheet-status').textContent = '파일을 선택하면 서버가 텍스트를 추출하고, 사양 ledger·PDG assertion에 원문 근거로 추가합니다. 7 MB 이하.';
+  target('#datasheet-status').className = '';
+  target('#session-title').textContent = '새 설계 세션';
+  target('#session-meta').textContent = 'session ' + state.sessionId.slice(0, 8);
+  clearResults();
   target('#workbench').scrollIntoView({ behavior: 'smooth', block: 'start' });
   setRunStatus('새 설계 세션', '사양을 조정한 뒤 에이전트 설계를 실행하세요.', false);
   showToast('새 설계 사양으로 초기화했습니다.');
+});
+
+target('#datasheet-input').addEventListener('change', (event) => {
+  const file = event.target.files?.[0] || null;
+  const status = target('#datasheet-status');
+  state.dataSheet = null;
+  if (!file) {
+    status.textContent = '파일을 선택하면 서버가 텍스트를 추출하고, 사양 ledger·PDG assertion에 원문 근거로 추가합니다. 7 MB 이하.';
+    status.className = '';
+    return;
+  }
+  if (file.size > 7 * 1024 * 1024) {
+    status.textContent = '7 MB 이하의 데이터시트만 첨부할 수 있습니다.';
+    status.className = 'error';
+    event.target.value = '';
+    return;
+  }
+  state.dataSheet = file;
+  status.textContent = file.name + ' · ' + Math.ceil(file.size / 1024) + ' KB · 다음 실행에서 사양·PDG에 반영됩니다.';
+  status.className = 'ready';
 });
 
 document.querySelectorAll('.nav-item').forEach((button) => {

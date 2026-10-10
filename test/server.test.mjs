@@ -91,6 +91,23 @@ test('blocks artifacts when local feasibility constraints fail', async () => {
   assert.equal(result.constraints.some((constraint) => constraint.id === 'feasibility_guard'), true);
 });
 
+test('ingests a TLV271 datasheet attachment into the PDG ledger fail-closed', async () => {
+  const result = await runDesignCycle({
+    circuit: 'two_stage_ota',
+    supply: 2.7,
+    dataSheet: {
+      fileName: 'tlv271.txt',
+      mimeType: 'text/plain',
+      contentBase64: Buffer.from('TLV271 3-MHz rail-to-rail operational amplifier').toString('base64')
+    }
+  });
+  assert.equal(result.dataSheet.parser, 'TI TLV271 deterministic profile');
+  assert.equal(result.dataSheet.requirements.length, 12);
+  assert.equal(result.pdg.valid, true);
+  assert.ok(result.constraints.some((item) => item.id === 'datasheet_slew_rate_typ' && item.coverage === 'unmapped'));
+  assert.equal(result.verification.exportAllowed, false);
+});
+
 test('applies only a validated structured planner action from the server-side LLM adapter', async () => {
   const originalFetch = global.fetch;
   const originalEnabled = process.env.FUSION_ENABLE_OPENAI;

@@ -748,6 +748,38 @@ select:focus-visible {
   line-height: 1.45;
 }
 
+.datasheet-field input[type="file"] {
+  width: 100%;
+  padding: 8px;
+  color: #506873;
+  font-family: var(--mono);
+  font-size: 9px;
+  background: #f7faf8;
+  border: 1px dashed #aac8bf;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.datasheet-field input[type="file"]::file-selector-button {
+  margin-right: 8px;
+  padding: 5px 8px;
+  color: #217660;
+  font: inherit;
+  font-weight: 700;
+  background: #e4f5ee;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.datasheet-field small.ready {
+  color: #178069;
+}
+
+.datasheet-field small.error {
+  color: #bc4444;
+}
+
 .canvas-actions {
   display: flex;
   gap: 6px;
