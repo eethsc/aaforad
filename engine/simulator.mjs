@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -19,6 +19,31 @@ export async function detectNgspice() {
   const executable = process.env.NGSPICE_PATH || 'ngspice';
   const result = await execute(executable, ['-v']);
   return { available: result.ok, executable, version: result.stdout.split(/\r?\n/)[0] || null };
+}
+
+/**
+ * The Docker image uses Volare's public SKY130 build at this location.
+ * A native install may override it with PDK_MODEL_FILE and PDK_CORNER.
+ */
+export async function detectPdk() {
+  const modelFile = process.env.PDK_MODEL_FILE
+    || '/opt/pdks/sky130A/libs.tech/ngspice/sky130.lib.spice';
+  try {
+    await access(modelFile);
+    return {
+      available: true,
+      name: process.env.PDK || 'sky130A',
+      modelFile,
+      corner: process.env.PDK_CORNER || 'tt'
+    };
+  } catch {
+    return {
+      available: false,
+      name: process.env.PDK || 'sky130A',
+      modelFile,
+      corner: process.env.PDK_CORNER || 'tt'
+    };
+  }
 }
 
 /**

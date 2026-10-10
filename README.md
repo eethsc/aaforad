@@ -6,7 +6,7 @@
 
 ## 실행
 
-Node.js 20 이상만 있으면 됩니다. 별도 패키지 설치가 필요하지 않습니다.
+간단한 UI/엔진 확인에는 Node.js 20 이상만 있으면 됩니다. 별도 패키지 설치가 필요하지 않습니다.
 
 ```powershell
 npm start
@@ -27,6 +27,28 @@ npm run check
 npm test
 ```
 
+## 재현 가능한 ngspice + SKY130 실행 (권장)
+
+Git에 ngspice 실행 파일이나 SKY130 PDK를 직접 넣지는 않습니다. PDK는 대용량 외부 배포물이며, 저장소에 복제하면 버전·라이선스 추적도 불가능해집니다. 대신 이 저장소는 **고정된 공개 Volare SKY130 artifact**를 첫 Docker 실행에 자동 설치하고, Docker 볼륨에 캐시합니다. 따라서 Docker Desktop(Windows/macOS) 또는 Docker Engine(Linux)만 있으면 어느 컴퓨터에서도 같은 simulator/PDK 조합을 사용합니다.
+
+1. `.env.example`을 `.env`로 복사해 `OPENROUTER_API_KEY`를 채웁니다. 이 파일은 Git에 포함되지 않습니다.
+2. 다음 명령을 실행합니다.
+
+```powershell
+docker compose up --build
+```
+
+처음 한 번은 SKY130 다운로드 때문에 시간이 걸리고 디스크 공간과 인터넷 연결이 필요합니다. 이후에는 `sky130-pdk` Docker 볼륨에서 재사용합니다. 브라우저는 [http://localhost:4174](http://localhost:4174)에서 엽니다.
+
+컨테이너는 `ngspice`, Volare, 그리고 `SKY130_PDK_VERSION`으로 고정한 `sky130A` PDK를 준비합니다. 기본 모델은 `/opt/pdks/sky130A/libs.tech/ngspice/sky130.lib.spice`, 코너는 `tt`입니다. 다른 검증 가능한 Volare build를 써야 할 때에만 `.env`에서 `SKY130_PDK_VERSION`을 바꾸고 다음을 실행하세요.
+
+```powershell
+docker compose down -v
+docker compose up --build
+```
+
+`down -v`는 캐시된 PDK 볼륨도 지우므로, 버전을 바꿀 때만 사용합니다.
+
 ## 구현된 설계 흐름
 
 | 단계 | UI / 서버 구현 | 연구 패턴 |
@@ -38,7 +60,7 @@ npm test
 | Verification | PDG 실행 순서, 별도 SymPy 프로세스 수치 오라클, closed-loop repair | AnalogVerifier |
 | Deliverables | SPICE 넷리스트, testbench skeleton, 역할별 변수, 다운로드 | ATLAS, AnalogVerifier |
 
-현재 지원 템플릿은 2-stage OTA, LDO, 8-bit SAR ADC입니다. 자유형 LLM 넷리스트 생성을 허용하지 않으며, 선택된 검증 템플릿과 동일한 결과만 생성합니다. local feasibility guard를 포함한 모든 수치 제약을 통과한 결과만 내보냅니다.
+현재 라이브러리는 OTA 계열, LDO, SAR/ΔΣ ADC, TIA, comparator, bandgap, charge pump, oscillator, buck, PLL, current mirror, filter 등 16개 제한 토폴로지를 다룹니다. 자연어 사양에서는 Architect가 이 제한된 라이브러리에서 회로군을 선택합니다. 자유형 LLM 넷리스트 생성을 허용하지 않으며, 선택된 검증 템플릿과 동일한 결과만 생성합니다. local feasibility guard를 포함한 모든 수치 제약을 통과한 결과만 내보냅니다.
 
 ## LLM Agent와 GraphRAG
 
@@ -62,9 +84,9 @@ OpenRouter의 OpenAI-compatible Chat Completions API를 서버에서만 호출�
 
 ## 실제 시뮬레이터 연결을 위한 준비
 
-현재 버전은 실행 시 `ngspice -v`를 감지하고, 설치되어 있으면 생성된 deck을 batch mode로 호출해 `.meas` 결과를 수집합니다. 이 폴더에는 PDK가 없으므로 현 환경에서는 surrogate 모드가 정상입니다. Cadence adapter는 별도의 상용 런타임 연결이 필요합니다.
+현재 버전은 실행 시 `ngspice -v`와 지정된 PDK model file을 함께 감지하고, 둘 다 있을 때만 생성된 deck을 batch mode로 호출해 `.meas` 결과를 수집합니다. Docker 경로에서는 이 둘이 자동으로 준비됩니다. 어느 하나라도 없으면 명시적으로 surrogate 모드가 되며 물리 시뮬레이션이라고 표시하지 않습니다. Cadence adapter는 별도의 상용 런타임 연결이 필요합니다.
 
-- **ngspice**: `NGSPICE_PATH`에 실행 경로를 설정하고, 실제 PDK model include 경로를 공급해야 합니다.
+- **ngspice**: native 실행에서는 `NGSPICE_PATH`, `PDK_MODEL_FILE`, `PDK_CORNER`를 설정합니다. Docker 실행에는 이미 설정되어 있습니다.
 - **Cadence**: 유효한 Virtuoso/Maestro 설치 및 라이선스, `CADENCE_PROJECT_DIR`, 쓰기 가능한 `AGENTIC_SIZING_CADENCE_WORK_ROOT`가 필요합니다.
 - **OpenRouter agent loop**: 위의 `OPENROUTER_API_KEY`, 사용 가능한 `OPENROUTER_MODEL`이 필요합니다.
 

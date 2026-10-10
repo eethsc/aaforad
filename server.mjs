@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runPuctSearch } from './engine/mcts.mjs';
 import { runParEgo } from './engine/parego.mjs';
 import { evaluateSymbolicOracle } from './engine/symbolic.mjs';
-import { detectNgspice, runNgspice } from './engine/simulator.mjs';
+import { detectNgspice, detectPdk, runNgspice } from './engine/simulator.mjs';
 import { buildResearchGraph, queryResearchGraph } from './engine/graphrag.mjs';
 import { callOpenRouterAgent, openRouterConfigured } from './engine/openrouter.mjs';
 
@@ -813,12 +813,14 @@ function runAgenticSizingCycle(template, spec, seed, selectedCandidate, plannerA
 
 function makeNetlist(template, spec, variables) {
   const byName = Object.fromEntries(variables.map((item) => [item.name, item.value]));
+  const pdkModelFile = process.env.PDK_MODEL_FILE || '<PDK_MODEL_FILE>';
+  const pdkCorner = process.env.PDK_CORNER || 'tt';
   const header = [
     '* FUSION Analog Agent Studio - constrained template output',
     '* Review with a qualified simulator and foundry PDK before fabrication.',
     '.title ' + template.label + ' | ' + spec.process,
     '.param VDD=' + spec.supply,
-    '.include <PDK_MODEL_FILE>',
+    '.lib ' + pdkModelFile + ' ' + pdkCorner,
     'VDD vdd 0 DC {VDD}'
   ];
 
@@ -836,8 +838,8 @@ function makeNetlist(template, spec, variables) {
   } else if (template.id === 'ldo') {
     body = [
       'VREF vref 0 DC 0.6',
-      'MERR ea vref fb vss nmos W=8u L=0.36u',
-      'MPASS vout ea vin vin pmos W=' + byName['W(MPASS)'] + 'u L=' + byName['L(MPASS)'] + 'u',
+      'MERR ea vref fb 0 sky130_fd_pr__nfet_01v8 W=8u L=0.36u',
+      'MPASS vout ea vin vin sky130_fd_pr__pfet_01v8 W=' + byName['W(MPASS)'] + 'u L=' + byName['L(MPASS)'] + 'u',
       'RFB1 vout fb 900k',
       'RFB2 fb 0 300k',
       'CC ea 0 ' + byName.Cc + 'p',
@@ -846,7 +848,7 @@ function makeNetlist(template, spec, variables) {
   } else if (template.id === 'sar_adc') {
     body = [
       'VREFP vref 0 DC ' + byName.Vref,
-      'MSW sample vin clk 0 nmos W=' + byName['W(MSW)'] + 'u L=0.18u',
+      'MSW sample vin clk 0 sky130_fd_pr__nfet_01v8 W=' + byName['W(MSW)'] + 'u L=0.18u',
       'C0 dac sample ' + byName.Cunit + 'f',
       'C1 dac sample ' + (byName.Cunit * 2) + 'f',
       'XCOMP dac vref dout vdd 0 strongarm_latch W=' + byName['W(MCOMP)'] + 'u',
@@ -854,12 +856,12 @@ function makeNetlist(template, spec, variables) {
     ];
   } else {
     body = [
-      'M1 n1 vinp tail 0 nmos W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
-      'M2 n2 vinn tail 0 nmos W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
-      'M3 n1 n1 vdd vdd pmos W=12u L=0.36u',
-      'M4 n2 n1 vdd vdd pmos W=12u L=0.36u',
-      'M5 tail vbias 0 0 nmos W=5u L=0.72u',
-      'M6 vout n2 vdd vdd pmos W=' + byName['W(M6)'] + 'u L=0.36u',
+      'M1 n1 vinp tail 0 sky130_fd_pr__nfet_01v8 W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
+      'M2 n2 vinn tail 0 sky130_fd_pr__nfet_01v8 W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
+      'M3 n1 n1 vdd vdd sky130_fd_pr__pfet_01v8 W=12u L=0.36u',
+      'M4 n2 n1 vdd vdd sky130_fd_pr__pfet_01v8 W=12u L=0.36u',
+      'M5 tail vbias 0 0 sky130_fd_pr__nfet_01v8 W=5u L=0.72u',
+      'M6 vout n2 vdd vdd sky130_fd_pr__pfet_01v8 W=' + byName['W(M6)'] + 'u L=0.36u',
       'CC vout n1 ' + byName.Cc + 'p',
       'RZ vout n1 ' + byName.Rz,
       'IBIAS vbias 0 DC ' + byName.Ibias + 'u'
@@ -1253,8 +1255,9 @@ export async function runDesignCycle(rawInput = {}) {
   const exportedNetlist = exportsAllowed ? makeNetlist(template, effectiveSpec, sizing.variables) : null;
   const exportedTestbench = exportsAllowed ? makeTestbench(template, effectiveSpec) : null;
   const ngspice = await detectNgspice();
-  let simulation = { mode: 'analytic-surrogate', status: ngspice, metrics: null, diagnostics: 'ngspice unavailable; analytic model used for optimization only' };
-  if (ngspice.available && exportedNetlist && exportedTestbench) {
+  const pdk = await detectPdk();
+  let simulation = { mode: 'analytic-surrogate', status: ngspice, pdk, metrics: null, diagnostics: 'ngspice or PDK unavailable; analytic model used for optimization only' };
+  if (ngspice.available && pdk.available && exportedNetlist && exportedTestbench) {
     const deck = exportedNetlist.replace(/\n\.end\s*$/i, '\n' + exportedTestbench + '\n.end');
     simulation = await runNgspice(deck);
   }

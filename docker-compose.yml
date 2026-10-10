@@ -1,0 +1,21 @@
+services:
+  fusion:
+    build:
+      context: .
+    ports:
+      - "${PORT:-4174}:4174"
+    environment:
+      PORT: 4174
+      FUSION_REQUIRE_LLM: "${FUSION_REQUIRE_LLM:-true}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      OPENROUTER_MODEL: "${OPENROUTER_MODEL:-openrouter/auto}"
+      FUSION_SIMULATOR: ngspice
+      PDK_ROOT: /opt/pdks
+      PDK: sky130A
+      PDK_MODEL_FILE: /opt/pdks/sky130A/libs.tech/ngspice/sky130.lib.spice
+      SKY130_PDK_VERSION: "${SKY130_PDK_VERSION:-7519dfb04400f224f140749cda44ee7de6f5e095}"
+    volumes:
+      - sky130-pdk:/opt/pdks
+
+volumes:
+  sky130-pdk:
