@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#07111e">
+    <title>FUSION — Analog Agent Studio</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="작업공간 탐색">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 36 36" role="img">
+              <path d="M5 24h7l4-12 5 17 4-9h6"></path>
+              <circle cx="5" cy="24" r="2"></circle>
+              <circle cx="31" cy="20" r="2"></circle>
+            </svg>
+          </div>
+          <div>
+            <div class="brand-name">FUSION</div>
+            <div class="brand-subtitle">ANALOG AGENT STUDIO</div>
+          </div>
+        </div>
+
+        <div class="workspace-switcher">
+          <span class="workspace-dot"></span>
+          <span>Research sandbox</span>
+          <span class="chevron">⌄</span>
+        </div>
+
+        <nav class="nav-list">
+          <button class="nav-item active" data-scroll-target="workbench">
+            <span class="nav-icon">⌘</span><span>설계 워크벤치</span>
+          </button>
+          <button class="nav-item" data-scroll-target="agents">
+            <span class="nav-icon">◈</span><span>에이전트 그래프</span>
+          </button>
+          <button class="nav-item" data-scroll-target="verify">
+            <span class="nav-icon">✓</span><span>검증 센터</span>
+          </button>
+          <button class="nav-item" data-scroll-target="exports">
+            <span class="nav-icon">⇩</span><span>아티팩트</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-section">
+          <div class="section-label">설계 세션</div>
+          <button class="session-row selected">
+            <span class="session-status"></span>
+            <span>
+              <strong>OTA · Low power</strong>
+              <small id="session-meta">local sandbox</small>
+            </span>
+          </button>
+          <button class="new-session" id="new-session-button">
+            <span>＋</span> 새 설계 세션
+          </button>
+        </div>
+
+        <div class="sidebar-footer">
+          <div class="local-indicator"><span></span> LOCAL MODE</div>
+          <p>모든 비밀키는 브라우저 밖의 서버 환경변수에만 보관됩니다.</p>
+        </div>
+      </aside>
+
+      <div class="content-area">
+        <header class="topbar">
+          <div class="breadcrumb">
+            <span>Projects</span><span class="breadcrumb-arrow">/</span><span>Sensor AFE</span>
+            <span class="breadcrumb-arrow">/</span><strong>OTA · Low power</strong>
+          </div>
+          <div class="topbar-actions">
+            <span class="runtime-chip" id="runtime-chip"><i></i> Local estimator</span>
+            <button class="icon-button" id="theme-button" aria-label="색상 테마 전환">◐</button>
+            <button class="avatar" aria-label="사용자 프로필">S</button>
+          </div>
+        </header>
+
+        <main class="workspace">
+          <section class="intro" id="workbench">
+            <div>
+              <div class="eyebrow"><span></span> MULTI-AGENT ANALOG DESIGN</div>
+              <h1>사양에서 검증된 넷리스트까지,<br><em>하나의 폐루프</em>로 설계하세요.</h1>
+              <p>토폴로지 탐색 · 역할 기반 사이징 · 기호 검증 · 시뮬레이션 피드백을 연결한 연구용 설계 워크벤치입니다.</p>
+            </div>
+            <div class="intro-status">
+              <span class="status-pulse"></span>
+              <div>
+                <strong id="run-status-title">준비됨</strong>
+                <small id="run-status-detail">키 없이 동작하는 결정론적 local estimator · not SPICE</small>
+              </div>
+            </div>
+          </section>
+
+          <section class="workbench-grid">
+            <form class="spec-panel panel" id="spec-form">
+              <div class="panel-heading">
+                <div>
+                  <span class="kicker">01 · DESIGN BRIEF</span>
+                  <h2>설계 사양</h2>
+                </div>
+                <span class="panel-badge">Editable</span>
+              </div>
+
+              <label class="field">
+                <span>회로 목표</span>
+                <select name="circuit" id="circuit-input">
+                  <option value="two_stage_ota">2-stage OTA · 증폭기</option>
+                  <option value="ldo">LDO · 전원 관리</option>
+                  <option value="sar_adc">8-bit SAR ADC · 혼성신호</option>
+                </select>
+              </label>
+              <div class="field-row">
+                <label class="field">
+                  <span>공정 / PDK</span>
+                  <input name="process" value="Sky130 · 130 nm">
+                </label>
+                <label class="field short">
+                  <span>VDD</span>
+                  <div class="unit-input"><input name="supply" type="number" min="0.6" max="5" step="0.1" value="1.8"><b>V</b></div>
+                </label>
+              </div>
+
+              <div class="target-grid">
+                <label class="target-field">
+                  <span>DC gain</span>
+                  <div class="unit-input"><input name="gainTarget" type="number" min="20" max="120" value="62"><b>dB</b></div>
+                </label>
+                <label class="target-field">
+                  <span>UGBW</span>
+                  <div class="unit-input"><input name="ugbwTarget" type="number" min="0.1" max="10000" step="0.1" value="28"><b>MHz</b></div>
+                </label>
+                <label class="target-field">
+                  <span>Phase margin</span>
+                  <div class="unit-input"><input name="phaseTarget" type="number" min="20" max="120" value="62"><b>°</b></div>
+                </label>
+                <label class="target-field">
+                  <span>Power ceiling</span>
+                  <div class="unit-input"><input name="powerTarget" type="number" min="0.01" max="1000" step="0.01" value="1.2"><b>mW</b></div>
+                </label>
+                <label class="target-field">
+                  <span>Noise ceiling</span>
+                  <div class="unit-input"><input name="noiseTarget" type="number" min="1" max="1000" step="0.1" value="38"><b>nV</b></div>
+                </label>
+                <label class="target-field">
+                  <span>Search budget</span>
+                  <div class="unit-input"><input name="searchBudget" type="number" min="8" max="256" value="48"><b>steps</b></div>
+                </label>
+              </div>
+
+              <label class="field">
+                <span>설계 의도</span>
+                <textarea name="prompt" rows="3">저전력 센서 인터페이스용으로 안정적인 이득과 위상 여유를 우선합니다.</textarea>
+              </label>
+
+              <div class="strategy-box">
+                <div class="strategy-top"><span>에이전트 전략</span><small>문서 기반 융합</small></div>
+                <div class="strategy-chips">
+                  <span>RAG grounding</span><span>PUCT search</span><span>Role sizing</span><span>PDG verifier</span>
+                </div>
+              </div>
+
+              <button class="primary-button" id="run-button" type="submit">
+                <span class="play-icon">▶</span> 에이전트 설계 실행
+                <span class="button-shortcut">⌘ ↵</span>
+              </button>
+              <p class="form-note">템플릿 제약과 수치 검증을 통과한 후보만 넷리스트로 내보냅니다.</p>
+            </form>
+
+            <section class="canvas-panel panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="kicker">02 · CONSTRAINED TOPOLOGY</span>
+                  <h2 id="topology-title">2-stage OTA</h2>
+                </div>
+                <div class="canvas-actions">
+                  <button class="subtle-button" id="fit-circuit-button">⊙ Fit</button>
+                  <button class="subtle-button" id="focus-circuit-button">⌁ Focus</button>
+                </div>
+              </div>
+
+              <div class="canvas-toolbar">
+                <span class="live-tag"><i></i> Template locked</span>
+                <span id="topology-summary">Differential pair · current mirror · Miller compensation</span>
+              </div>
+              <div class="circuit-stage" id="circuit-stage" aria-label="회로 토폴로지 캔버스"></div>
+              <div class="canvas-footer">
+                <div class="legend">
+                  <span><i class="legend-port"></i> external port</span>
+                  <span><i class="legend-node"></i> internal node</span>
+                  <span><i class="legend-role"></i> role boundary</span>
+                </div>
+                <span class="matrix-tag" id="matrix-tag">B ∈ R⁸×⁸ · valid graph</span>
+              </div>
+            </section>
+          </section>
+
+          <section class="metrics-section" aria-label="설계 결과 지표">
+            <div class="section-heading-row">
+              <div>
+                <span class="kicker">03 · LOCAL ESTIMATE ANCHOR</span>
+                <h2>최적 후보 성능</h2>
+              </div>
+              <div class="cache-label" id="cache-label"><span>◌</span> 아직 실행되지 않음</div>
+            </div>
+            <div class="metrics-grid" id="metrics-grid">
+              <div class="metric-card skeleton-card"></div>
+              <div class="metric-card skeleton-card"></div>
+              <div class="metric-card skeleton-card"></div>
+              <div class="metric-card skeleton-card"></div>
+              <div class="metric-card skeleton-card"></div>
+            </div>
+          </section>
+
+          <section class="execution-grid" id="agents">
+            <section class="pipeline-panel panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="kicker">04 · AGENT ORCHESTRATION</span>
+                  <h2>설계 그래프</h2>
+                </div>
+                <span class="iteration-pill" id="iteration-pill">0 mock evaluation records</span>
+              </div>
+              <div class="pipeline" id="agent-pipeline" aria-live="polite"></div>
+              <div class="planner-note">
+                <div class="planner-note-icon">✦</div>
+                <div>
+                  <span>PLANNER NOTE</span>
+                  <p id="planner-text">실행하면 사양·토폴로지·역할 태그를 기반으로 계획을 생성합니다.</p>
+                </div>
+              </div>
+            </section>
+
+            <section class="search-panel panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="kicker">TOPOLOGY SEARCH</span>
+                  <h2>PUCT 후보 큐</h2>
+                </div>
+                <span class="mini-brand">EXPLORE</span>
+              </div>
+              <div class="candidate-list" id="candidate-list"></div>
+              <div class="search-footnote">
+                <span>p ≥ .99 structural tokens</span>
+                <strong id="filter-stat">— auto-committed</strong>
+              </div>
+            </section>
+          </section>
+
+          <section class="verification-grid" id="verify">
+            <section class="verification-panel panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="kicker">05 · NEURO-SYMBOLIC VERIFICATION</span>
+                  <h2>제약 · PDG · 수치 오라클</h2>
+                </div>
+                <span class="verification-status" id="verification-status">대기</span>
+              </div>
+              <div class="constraint-list" id="constraint-list"></div>
+              <div class="pdg-flow" id="pdg-flow"></div>
+              <div class="repair-callout" id="repair-callout"></div>
+            </section>
+
+            <section class="chart-panel panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="kicker">OPTIMIZATION TRACE</span>
+                  <h2>제약 위반도</h2>
+                </div>
+                <div class="chart-legend"><span></span> weighted violation</div>
+              </div>
+              <div class="chart-wrap" id="chart-wrap"></div>
+              <div class="chart-foot"><span>초기 anchor</span><span>역할 기반 갱신</span><span>통과 후보</span></div>
+            </section>
+          </section>
+
+          <section class="knowledge-panel panel">
+            <div class="panel-heading">
+              <div>
+                <span class="kicker">RETRIEVAL / REUSABLE KNOWLEDGE</span>
+                <h2>설계 근거 레이어</h2>
+              </div>
+              <span class="knowledge-count" id="knowledge-count">5 research patterns fused</span>
+            </div>
+            <div class="source-grid" id="source-grid"></div>
+          </section>
+
+          <section class="exports-panel panel" id="exports">
+            <div class="panel-heading">
+              <div>
+                <span class="kicker">06 · DELIVERABLES</span>
+                <h2>넷리스트와 검증 아티팩트</h2>
+              </div>
+              <div class="export-actions">
+                <button class="subtle-button" id="copy-button">복사</button>
+                <button class="dark-button" id="download-netlist-button">SPICE skeleton 다운로드 <span>↓</span></button>
+              </div>
+            </div>
+            <div class="artifact-tabs" role="tablist">
+              <button class="artifact-tab active" data-artifact="netlist" role="tab">Generated netlist</button>
+              <button class="artifact-tab" data-artifact="testbench" role="tab">Testbench skeleton</button>
+              <button class="artifact-tab" data-artifact="variables" role="tab">Role-scoped variables</button>
+            </div>
+            <pre class="artifact-code" id="artifact-code">실행 후 템플릿 제약 넷리스트가 이곳에 표시됩니다.</pre>
+          </section>
+
+          <footer class="app-footer">
+            <span>FUSION v0.1 · research prototype</span>
+            <span>Not SPICE-validated · fabrication requires qualified PDK and sign-off.</span>
+          </footer>
+        </main>
+      </div>
+    </div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

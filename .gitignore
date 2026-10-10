@@ -1,0 +1,7 @@
+.env
+.DS_Store
+node_modules/
+coverage/
+
+# Local paper corpus; source citations remain in the Markdown report.
+*.pdf
