@@ -402,9 +402,61 @@ function detectRequirementOperator(clause, metric) {
   return ['noise', 'power', 'supply_current', 'input_offset_voltage', 'input_bias_current', 'thd_n', 'settling'].includes(metric) ? '<=' : '>=';
 }
 
+function voltageInVolts(value, unit) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  return String(unit || '').toLowerCase() === 'mv' ? numeric / 1000 : numeric;
+}
+
+function extractSupplyRangeRequirements(lines, fileName) {
+  const requirements = [];
+  const seen = new Set();
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+    const namesSupply = /\b(?:supply(?:\s+voltage)?|operating voltage|vdd|vcc)\b/.test(lower);
+    const excludesSupply = /absolute\s+max|maximum\s+ratings?|breakdown|input\s+voltage|output\s+voltage|common.?mode|test\s+condition/.test(lower);
+    if (!namesSupply || excludesSupply) continue;
+    let voltages = [...line.matchAll(/(-?\d+(?:\.\d+)?)\s*(m?V)\b/gi)]
+      .map((match) => voltageInVolts(match[1], match[2]))
+      .filter((value) => value !== null && value >= 0.4 && value <= 100);
+    // PDF table extraction often leaves the unit only after the final
+    // Min/Typ/Max value: "Supply voltage 2.7 3.3 5.5 V".
+    const trailingTable = line.match(/((?:-?\d+(?:\.\d+)?[\s,]+){1,3}-?\d+(?:\.\d+)?)\s*(m?V)\b/i);
+    if (trailingTable) {
+      const tableValues = trailingTable[1].match(/-?\d+(?:\.\d+)?/g) || [];
+      voltages = tableValues.map((value) => voltageInVolts(value, trailingTable[2]))
+        .filter((value) => value !== null && value >= 0.4 && value <= 100);
+    }
+    if (!voltages.length) continue;
+    const unique = [...new Set(voltages)];
+    const hasRange = unique.length >= 2 || /\b(?:min(?:imum)?|max(?:imum)?|to|range)\b|[-–—]/.test(lower);
+    const minimum = Math.min(...unique);
+    const maximum = Math.max(...unique);
+    const add = (operator, value) => {
+      const key = operator + '|' + value;
+      if (seen.has(key)) return;
+      seen.add(key);
+      requirements.push(adaptDataSheetRequirement(dataSheetRequirement(
+        'supply_' + requirements.length,
+        'supply', operator, value, 'V', 'op',
+        compactText(line, fileName, 240)
+      )));
+    };
+    // A singleton e.g. "VDD = 1.8 V" is a measurement condition, not a
+    // legal operating bound. Only a stated minimum, maximum, or range binds
+    // the user-selected supply.
+    if (hasRange && unique.length >= 2) {
+      add('>=', minimum);
+      add('<=', maximum);
+    } else if (/\bmin(?:imum)?\b/.test(lower)) add('>=', minimum);
+    else if (/\bmax(?:imum)?\b/.test(lower)) add('<=', maximum);
+  }
+  return requirements;
+}
+
 function extractGenericDataSheetRequirements(text, fileName) {
   const lines = text.split(/\r?\n/).map((line) => compactText(line, '', 360)).filter(Boolean);
-  const requirements = [];
+  const requirements = extractSupplyRangeRequirements(lines, fileName);
   const reviewCandidates = [];
   const seen = new Set();
   const numeric = /(-?\d+(?:\.\d+)?)\s*-?\s*(MHz|kHz|GHz|nV\s*\/\s*√?Hz|V\s*\/\s*[µu]s|mV|mA|µA|uA|pA|mW|W|V|dB|°C|%|ns|us|µs)/i;
@@ -417,6 +469,9 @@ function extractGenericDataSheetRequirements(text, fileName) {
       if (reviewCandidates.length < 12 && !reviewCandidates.includes(source)) reviewCandidates.push(source);
       continue;
     }
+    // Supply is parsed above because a table's Min/Typ/Max columns and a
+    // condition such as "VDD = 1.8 V" have different contractual meaning.
+    if (adapter.metric === 'supply') continue;
     const key = adapter.metric + '|' + match[1] + '|' + match[2].toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
