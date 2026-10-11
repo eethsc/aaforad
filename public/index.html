@@ -34,11 +34,11 @@
           <button class="nav-item active" data-scroll-target="workbench">
             <span class="nav-icon">⌘</span><span>설계 워크벤치</span>
           </button>
-          <button class="nav-item" data-scroll-target="agents">
-            <span class="nav-icon">◈</span><span>에이전트 그래프</span>
-          </button>
           <button class="nav-item" data-scroll-target="verify">
             <span class="nav-icon">✓</span><span>검증 센터</span>
+          </button>
+          <button class="nav-item" data-scroll-target="knowledge-base-panel">
+            <span class="nav-icon">◈</span><span>지식 베이스</span>
           </button>
           <button class="nav-item" data-scroll-target="exports">
             <span class="nav-icon">⇩</span><span>아티팩트</span>
@@ -46,17 +46,11 @@
         </nav>
 
         <div class="sidebar-section">
-          <div class="section-label">설계 세션</div>
-          <button class="session-row selected" id="session-row">
-            <span class="session-status"></span>
-            <span>
-              <strong id="session-title">새 설계 세션</strong>
-              <small id="session-meta">local sandbox</small>
-            </span>
-          </button>
-          <button class="new-session" id="new-session-button">
-            <span>＋</span> 새 설계 세션
-          </button>
+          <div class="section-label-row">
+            <span class="section-label">설계 세션</span>
+            <button class="icon-small-btn" id="new-session-button" title="새 설계 세션 추가">＋ 추가</button>
+          </div>
+          <div class="session-list" id="session-list" role="list"></div>
         </div>
 
         <div class="sidebar-footer">
@@ -68,8 +62,8 @@
       <div class="content-area">
         <header class="topbar">
           <div class="breadcrumb">
-            <span>Projects</span><span class="breadcrumb-arrow">/</span><span>Sensor AFE</span>
-            <span class="breadcrumb-arrow">/</span><strong>OTA · Low power</strong>
+            <span>Analog Studio</span><span class="breadcrumb-arrow">/</span><span id="breadcrumb-category">Workspace</span>
+            <span class="breadcrumb-arrow">/</span><strong id="breadcrumb-title">새 설계 세션</strong>
           </div>
           <div class="topbar-actions">
             <span class="runtime-chip" id="runtime-chip"><i></i> Local estimator</span>
@@ -158,23 +152,23 @@
               <div class="target-grid">
                 <label class="target-field">
                   <span>DC gain</span>
-                  <div class="unit-input"><input name="gainTarget" type="number" min="20" max="120" value="62"><b>dB</b></div>
+                  <div class="unit-input"><input name="gainTarget" type="number" min="20" max="120" placeholder="선택 (예: 60)"><b>dB</b></div>
                 </label>
                 <label class="target-field">
                   <span>UGBW</span>
-                  <div class="unit-input"><input name="ugbwTarget" type="number" min="0.1" max="10000" step="0.1" value="28"><b>MHz</b></div>
+                  <div class="unit-input"><input name="ugbwTarget" type="number" min="0.1" max="10000" step="0.1" placeholder="선택 (예: 25)"><b>MHz</b></div>
                 </label>
                 <label class="target-field">
                   <span>Phase margin</span>
-                  <div class="unit-input"><input name="phaseTarget" type="number" min="20" max="120" value="62"><b>°</b></div>
+                  <div class="unit-input"><input name="phaseTarget" type="number" min="20" max="120" placeholder="선택 (예: 60)"><b>°</b></div>
                 </label>
                 <label class="target-field">
                   <span>Power ceiling</span>
-                  <div class="unit-input"><input name="powerTarget" type="number" min="0.01" max="1000" step="0.01" value="1.2"><b>mW</b></div>
+                  <div class="unit-input"><input name="powerTarget" type="number" min="0.01" max="1000" step="0.01" placeholder="선택 (예: 1.5)"><b>mW</b></div>
                 </label>
                 <label class="target-field">
                   <span>Noise ceiling</span>
-                  <div class="unit-input"><input name="noiseTarget" type="number" min="1" max="1000" step="0.1" value="38"><b>nV</b></div>
+                  <div class="unit-input"><input name="noiseTarget" type="number" min="1" max="1000" step="0.1" placeholder="선택 (예: 40)"><b>nV</b></div>
                 </label>
                 <label class="target-field">
                   <span>Search budget</span>
@@ -184,7 +178,7 @@
 
               <label class="field">
                 <span>설계 의도</span>
-                <textarea name="prompt" rows="3">저전력 센서 인터페이스용으로 안정적인 이득과 위상 여유를 우선합니다.</textarea>
+                <textarea name="prompt" rows="3" placeholder="예: 저전력 센서 인터페이스용으로 안정적인 이득과 위상 여유를 우선합니다.">저전력 센서 인터페이스용으로 안정적인 이득과 위상 여유를 우선합니다.</textarea>
               </label>
 
               <div class="strategy-box">
@@ -205,7 +199,7 @@
               <div class="panel-heading">
                 <div>
                   <span class="kicker">02 · CONSTRAINED TOPOLOGY</span>
-                  <h2 id="topology-title">2-stage OTA</h2>
+                  <h2 id="topology-title">회로 토폴로지 대기 중</h2>
                 </div>
                 <div class="canvas-actions">
                   <button class="subtle-button" id="fit-circuit-button">⊙ Fit</button>
@@ -214,17 +208,22 @@
               </div>
 
               <div class="canvas-toolbar">
-                <span class="live-tag"><i></i> Template locked</span>
-                <span id="topology-summary">Differential pair · current mirror · Miller compensation</span>
+                <span class="live-tag"><i></i> Standby</span>
+                <span id="topology-summary">설계를 실행하면 선택된 회로군의 템플릿과 그래프가 렌더링됩니다.</span>
               </div>
-              <div class="circuit-stage" id="circuit-stage" aria-label="회로 토폴로지 캔버스"></div>
+              <div class="circuit-stage" id="circuit-stage" aria-label="회로 토폴로지 캔버스">
+                <div class="circuit-empty-placeholder">
+                  <div class="circuit-empty-icon">⚡</div>
+                  <p>회로 유형과 사양을 입력한 후 <strong>'에이전트 설계 실행'</strong>을 누르면<br>검증된 넷리스트 토폴로지가 여기에 시각화됩니다.</p>
+                </div>
+              </div>
               <div class="canvas-footer">
                 <div class="legend">
                   <span><i class="legend-port"></i> external port</span>
                   <span><i class="legend-node"></i> internal node</span>
                   <span><i class="legend-role"></i> role boundary</span>
                 </div>
-                <span class="matrix-tag" id="matrix-tag">B ∈ R⁸×⁸ · valid graph</span>
+                <span class="matrix-tag" id="matrix-tag">B ∈ Rⁿˣᵐ · awaiting run</span>
               </div>
             </section>
           </section>
@@ -246,41 +245,6 @@
             </div>
           </section>
 
-          <section class="execution-grid" id="agents">
-            <section class="pipeline-panel panel">
-              <div class="panel-heading">
-                <div>
-                  <span class="kicker">04 · AGENT ORCHESTRATION</span>
-                  <h2>설계 그래프</h2>
-                </div>
-                <span class="iteration-pill" id="iteration-pill">0 optimization records</span>
-              </div>
-              <div class="pipeline" id="agent-pipeline" aria-live="polite"></div>
-              <div class="planner-note">
-                <div class="planner-note-icon">✦</div>
-                <div>
-                  <span>PLANNER NOTE</span>
-                  <p id="planner-text">실행하면 사양·토폴로지·역할 태그를 기반으로 계획을 생성합니다.</p>
-                </div>
-              </div>
-            </section>
-
-            <section class="search-panel panel">
-              <div class="panel-heading">
-                <div>
-                  <span class="kicker">TOPOLOGY SEARCH</span>
-                  <h2>PUCT 후보 큐</h2>
-                </div>
-                <span class="mini-brand">EXPLORE</span>
-              </div>
-              <div class="candidate-list" id="candidate-list"></div>
-              <div class="search-footnote">
-                <span>p ≥ .99 structural tokens</span>
-                <strong id="filter-stat">— auto-committed</strong>
-              </div>
-            </section>
-          </section>
-
           <section class="verification-grid" id="verify">
             <section class="verification-panel panel">
               <div class="panel-heading">
@@ -292,6 +256,16 @@
               </div>
               <div class="constraint-list" id="constraint-list"></div>
               <div class="pdg-flow" id="pdg-flow"></div>
+              
+              <!-- Datasheet-driven Dependency Graph Canvas -->
+              <div class="pdg-graph-box">
+                <div class="graph-box-header">
+                  <span>📊 데이터시트 기반 Port Dependency Graph (PDG) 연결망</span>
+                  <small id="pdg-graph-meta">의존성 검증</small>
+                </div>
+                <div class="pdg-svg-canvas" id="pdg-svg-canvas"></div>
+              </div>
+
               <div class="repair-callout" id="repair-callout"></div>
             </section>
 
@@ -308,14 +282,29 @@
             </section>
           </section>
 
-          <section class="knowledge-panel panel">
+          <!-- GraphRAG Knowledge Base Visualizer -->
+          <section class="knowledge-panel panel" id="knowledge-base-panel">
             <div class="panel-heading">
               <div>
-                <span class="kicker">RETRIEVAL / REUSABLE KNOWLEDGE</span>
-                <h2>설계 근거 레이어</h2>
+                <span class="kicker">GRAPHRAG · KNOWLEDGE BASE EXPLORER</span>
+                <h2>지식 베이스 그래프 & 노드 선택 시각화</h2>
               </div>
-              <span class="knowledge-count" id="knowledge-count">5 research patterns fused</span>
+              <span class="knowledge-count" id="knowledge-count">GraphRAG Evidence</span>
             </div>
+
+            <div class="graphrag-visualizer">
+              <div class="graphrag-toolbar">
+                <div class="graphrag-legend">
+                  <span class="legend-chip paper"><i class="dot paper"></i> 논문 (Paper)</span>
+                  <span class="legend-chip claim"><i class="dot claim"></i> 핵심 주장 (Claim)</span>
+                  <span class="legend-chip selected"><i class="dot active"></i> LLM이 선택한 노드</span>
+                </div>
+                <span class="graph-stats-chip" id="graphrag-stats-chip">0 Nodes · 0 Edges</span>
+              </div>
+              <div class="graphrag-svg-container" id="graphrag-canvas"></div>
+              <div class="graphrag-traversal-paths" id="graphrag-paths"></div>
+            </div>
+
             <div class="source-grid" id="source-grid"></div>
           </section>
 

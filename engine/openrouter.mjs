@@ -23,7 +23,8 @@ function jsonFromContent(content) {
 export async function callOpenRouterAgent({ name, system, prompt, schema, temperature = 0.15 }) {
   if (!openRouterConfigured()) throw new Error('OPENROUTER_API_KEY and OPENROUTER_MODEL are required');
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  const timeoutMs = Number(process.env.OPENROUTER_TIMEOUT_MS) || 60000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(ENDPOINT, {
       method: 'POST',
