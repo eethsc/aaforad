@@ -159,3 +159,38 @@ test('serves the health endpoint and the agent endpoint', async () => {
   assert.equal(payload.topology.id, 'ldo');
   assert.match(payload.netlist, /MPASS/);
 });
+
+test('creates server-issued sessions and keeps result payloads out of the session list', async () => {
+  const app = createApp();
+  const created = await requestApp(app, 'POST', '/api/sessions', {
+    id: 'client-controlled-id',
+    title: 'Session API test',
+    payload: { shouldNot: 'persist' },
+    result: { shouldNot: 'persist' }
+  });
+  assert.equal(created.statusCode, 201);
+  assert.notEqual(created.body.id, 'client-controlled-id');
+  assert.equal(created.body.hasResult, false);
+  assert.equal('payload' in created.body, false);
+  assert.equal('result' in created.body, false);
+
+  const listed = await requestApp(app, 'GET', '/api/sessions');
+  const summary = listed.body.sessions.find((session) => session.id === created.body.id);
+  assert.ok(summary);
+  assert.equal('result' in summary, false);
+
+  const detail = await requestApp(app, 'GET', '/api/sessions/' + created.body.id);
+  assert.equal(detail.statusCode, 200);
+  assert.equal(detail.body.id, created.body.id);
+  assert.equal(detail.body.result, null);
+});
+
+test('does not return internal error stacks to API clients', async () => {
+  const app = createApp();
+  const response = await requestApp(app, 'POST', '/api/agent/run', {
+    dataSheet: { fileName: 'unsupported.exe', contentBase64: 'dGVzdA==' }
+  });
+  assert.equal(response.statusCode, 415);
+  assert.match(response.body.error, /Only PDF/);
+  assert.equal('stack' in response.body, false);
+});

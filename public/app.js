@@ -4,7 +4,7 @@ const state = {
   running: false,
   toastTimer: null,
   dataSheet: null,
-  sessionId: globalThis.crypto?.randomUUID?.() || String(Date.now())
+  sessionId: null
 };
 
 const form = document.querySelector('#spec-form');
@@ -691,7 +691,15 @@ async function refreshSessions() {
   }
 }
 
-function selectSession(sess) {
+async function selectSession(sess) {
+  if (!sess.result && sess.hasResult) {
+    try {
+      sess = await fetchJson('/api/sessions/' + encodeURIComponent(sess.id));
+    } catch (err) {
+      showToast('세션을 불러오지 못했습니다: ' + err.message);
+      return;
+    }
+  }
   state.sessionId = sess.id;
   const titleEl = target('#session-title');
   if (titleEl) titleEl.textContent = sess.title;
@@ -714,14 +722,12 @@ function selectSession(sess) {
 }
 
 async function createNewSession() {
-  const newId = globalThis.crypto?.randomUUID?.() || String(Date.now());
   const newTitle = '세션 ' + (document.querySelectorAll('.session-card').length + 1) + ' · ' + target('#circuit-input').value;
   try {
     const created = await fetchJson('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        id: newId,
         title: newTitle,
         meta: 'local custom sandbox',
         circuit: target('#circuit-input').value
@@ -797,6 +803,29 @@ target('[name="naturalRequest"]').addEventListener('input', (event) => {
 });
 
 updateCircuitLabels();
-refreshSessions();
-bootstrap();
+
+async function initialize() {
+  try {
+    const created = await fetchJson('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: '새 설계 세션 (대기 중)',
+        meta: '사양 입력 후 실행하세요',
+        circuit: target('#circuit-input').value
+      })
+    });
+    state.sessionId = created.id;
+    const sessionTitleEl = target('#session-title');
+    if (sessionTitleEl) sessionTitleEl.textContent = created.title;
+    const sessionMetaEl = target('#session-meta');
+    if (sessionMetaEl) sessionMetaEl.textContent = created.meta;
+  } catch (err) {
+    showToast('세션 초기화 오류: ' + err.message);
+  }
+  await refreshSessions();
+  await bootstrap();
+}
+
+initialize();
 

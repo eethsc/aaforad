@@ -5,7 +5,6 @@ import { execFile } from 'node:child_process';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runPuctSearch } from './engine/mcts.mjs';
 import { runParEgo } from './engine/parego.mjs';
@@ -378,32 +377,9 @@ async function parseDataSheet(input) {
     }
 
     if (!pdftotextExtracted || !text.trim()) {
-      // Decompress FlateDecode streams from PDF binary using zlib
-      const binaryString = bytes.toString('binary');
-      let decompressedText = '';
-      const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-      let streamMatch;
-      while ((streamMatch = streamRegex.exec(binaryString)) !== null) {
-        const rawStream = Buffer.from(streamMatch[1], 'binary');
-        let decomp = null;
-        try { decomp = zlib.inflateSync(rawStream); } catch {}
-        if (!decomp) {
-          try { decomp = zlib.inflateRawSync(rawStream); } catch {}
-        }
-        if (decomp) {
-          const streamStr = decomp.toString('utf8');
-          const tjMatches = streamStr.match(/\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*T[jJ]/g) || [];
-          for (const tj of tjMatches) {
-            decompressedText += tj.replace(/\)\s*T[jJ]$/, '').replace(/^\(/, '') + ' ';
-          }
-        }
-      }
-      if (decompressedText.trim().length > 50) {
-        text = decompressedText;
-      } else {
-        const rawTextTokens = binaryString.match(/[a-zA-Z0-9_.-]{2,}/g) || [];
-        text = rawTextTokens.join(' ');
-      }
+      const error = new Error('PDF text extraction failed. Install Poppler pdftotext or upload a text-based datasheet.');
+      error.statusCode = 422;
+      throw error;
     }
   } else {
     text = bytes.toString('utf8');
@@ -1587,21 +1563,35 @@ async function serveStatic(response, requestPath) {
 }
 
 const SESSIONS_STORE = new Map();
+const MAX_SESSIONS = 50;
 
-function defaultSessionList() {
-  if (SESSIONS_STORE.size === 0) {
-    const defaultId = 'sess-initial';
-    SESSIONS_STORE.set(defaultId, {
-      id: defaultId,
-      title: '새 설계 세션 (대기 중)',
-      meta: '사양 입력 후 실행하세요',
-      createdAt: new Date().toISOString(),
-      circuit: 'auto',
-      dataSheetName: null,
-      result: null
-    });
+function sessionSummary(session) {
+  const { result, ...summary } = session;
+  return { ...summary, hasResult: Boolean(result) };
+}
+
+function sessionList() {
+  return [...SESSIONS_STORE.values()]
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+function createSession(body = {}) {
+  while (SESSIONS_STORE.size >= MAX_SESSIONS) {
+    const oldest = sessionList().at(-1);
+    if (!oldest) break;
+    SESSIONS_STORE.delete(oldest.id);
   }
-  return [...SESSIONS_STORE.values()].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const session = {
+    id: randomUUID(),
+    title: compactText(body.title, '새 설계 세션', 100),
+    meta: compactText(body.meta, '사양 입력 후 실행하세요', 80),
+    createdAt: new Date().toISOString(),
+    circuit: compactText(body.circuit, 'two_stage_ota', 80),
+    dataSheetName: null,
+    result: null
+  };
+  SESSIONS_STORE.set(session.id, session);
+  return session;
 }
 
 export function createApp() {
@@ -1624,24 +1614,23 @@ export function createApp() {
         return;
       }
       if (request.method === 'GET' && url.pathname === '/api/sessions') {
-        sendJson(response, 200, { sessions: defaultSessionList() });
+        sendJson(response, 200, { sessions: sessionList().map(sessionSummary) });
         return;
       }
       if (request.method === 'POST' && url.pathname === '/api/sessions') {
         const body = await readJsonBody(request);
-        const id = body.id || randomUUID();
-        const session = {
-          id,
-          title: compactText(body.title, '새 설계 세션', 100),
-          meta: compactText(body.meta, 'custom sandbox', 80),
-          createdAt: new Date().toISOString(),
-          circuit: body.circuit || 'two_stage_ota',
-          dataSheetName: body.dataSheetName || null,
-          payload: body.payload || null,
-          result: body.result || null
-        };
-        SESSIONS_STORE.set(id, session);
-        sendJson(response, 201, session);
+        const session = createSession(body);
+        sendJson(response, 201, sessionSummary(session));
+        return;
+      }
+      if (request.method === 'GET' && url.pathname.startsWith('/api/sessions/')) {
+        const id = url.pathname.slice('/api/sessions/'.length);
+        const session = SESSIONS_STORE.get(id);
+        if (!session) {
+          sendJson(response, 404, { error: 'Session not found' });
+          return;
+        }
+        sendJson(response, 200, session);
         return;
       }
       if (request.method === 'DELETE' && url.pathname.startsWith('/api/sessions/')) {
@@ -1660,6 +1649,7 @@ export function createApp() {
             current.circuit = result.topology.id;
             current.title = result.topology.label + ' · ' + (result.spec.prompt ? result.spec.prompt.slice(0, 24) : 'Design');
             current.meta = (result.spec.dataSheet ? result.spec.dataSheet.fileName : result.spec.process) + ' (' + (result.verification.exportAllowed ? 'VERIFIED' : 'ATTN') + ')';
+            current.dataSheetName = result.spec.dataSheet?.fileName || null;
           }
         }
         sendJson(response, 200, result);
@@ -1679,8 +1669,7 @@ export function createApp() {
       console.error('Server error on', request.method, url?.pathname || request.url, error);
       const status = error && Number.isInteger(error.statusCode) ? error.statusCode : 500;
       sendJson(response, status, {
-        error: error.message || 'Internal server error',
-        stack: error.stack
+        error: status >= 500 ? 'Internal server error' : (error.message || 'Request failed')
       });
     }
   });
