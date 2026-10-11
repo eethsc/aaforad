@@ -4,6 +4,7 @@ const state = {
   running: false,
   toastTimer: null,
   dataSheet: null,
+  dataSheetContract: null,
   sessionId: null
 };
 
@@ -69,6 +70,58 @@ async function formPayload() {
     };
   }
   return payload;
+}
+
+function contractError() {
+  const contract = state.dataSheetContract;
+  if (contract?.blockers?.length) return contract.blockers.join(' ');
+  if (target('[name="pdk"]').value === 'external') return '외부 PDK adapter가 아직 연결되지 않았습니다.';
+  const circuit = target('#circuit-input').value;
+  if (['buck_converter', 'class_d_audio_amp'].includes(circuit)) {
+    return '선택한 회로는 SKY130A의 온칩 수동소자·전력소자 범위를 벗어납니다.';
+  }
+  return '';
+}
+
+function refreshRunAvailability() {
+  if (!runButton) return;
+  runButton.disabled = state.running || Boolean(contractError());
+}
+
+function applyDataSheetContract(contract) {
+  state.dataSheetContract = contract;
+  const circuit = target('#circuit-input');
+  const supply = target('[name="supply"]');
+  if (contract.lockedCircuit) {
+    circuit.value = contract.lockedCircuit;
+    circuit.disabled = true;
+  } else {
+    circuit.disabled = false;
+  }
+  if (contract.supplyRange?.minimum !== null) supply.min = String(contract.supplyRange.minimum);
+  if (contract.supplyRange?.maximum !== null) supply.max = String(contract.supplyRange.maximum);
+  updateCircuitLabels();
+  refreshRunAvailability();
+}
+
+function clearDataSheetContract() {
+  state.dataSheetContract = null;
+  target('#circuit-input').disabled = false;
+  const supply = target('[name="supply"]');
+  supply.min = '0.6';
+  supply.max = '5';
+  refreshRunAvailability();
+}
+
+async function inspectDataSheet() {
+  const payload = await formPayload();
+  const inspected = await fetchJson('/api/datasheet/inspect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  applyDataSheetContract(inspected.contract);
+  return inspected;
 }
 
 function updateCircuitLabels() {
@@ -553,6 +606,13 @@ function startRunAnimation() {
 async function runDesign(event) {
   if (event) event.preventDefault();
   if (state.running) return;
+  const invalid = contractError();
+  if (invalid) {
+    setRunStatus('입력 계약 불일치', invalid, false);
+    showToast('설계 실행을 차단했습니다: ' + invalid);
+    refreshRunAvailability();
+    return;
+  }
   state.running = true;
   runButton.disabled = true;
   runButton.innerHTML = '<span class="play-icon">◌</span> 에이전트가 설계 중입니다 <span class="button-shortcut">ESC to wait</span>';
@@ -742,6 +802,7 @@ async function createNewSession() {
     form.reset();
     state.sessionId = created.id;
     state.dataSheet = null;
+    clearDataSheetContract();
     state.result = null;
     state.artifact = 'netlist';
     target('#datasheet-input').value = '';
@@ -766,10 +827,11 @@ async function createNewSession() {
 
 target('#new-session-button').addEventListener('click', createNewSession);
 
-target('#datasheet-input').addEventListener('change', (event) => {
+target('#datasheet-input').addEventListener('change', async (event) => {
   const file = event.target.files?.[0] || null;
   const status = target('#datasheet-status');
   state.dataSheet = null;
+  clearDataSheetContract();
   if (!file) {
     status.textContent = '파일을 선택하면 서버가 텍스트를 추출하고, 사양 ledger·PDG assertion에 원문 근거로 추가합니다. 7 MB 이하.';
     status.className = '';
@@ -782,8 +844,26 @@ target('#datasheet-input').addEventListener('change', (event) => {
     return;
   }
   state.dataSheet = file;
-  status.textContent = file.name + ' · ' + Math.ceil(file.size / 1024) + ' KB · 다음 실행에서 사양·PDG에 반영됩니다.';
+  status.textContent = file.name + ' · 데이터시트와 PDK 계약을 검사 중입니다.';
   status.className = 'ready';
+  try {
+    const inspected = await inspectDataSheet();
+    const blockers = inspected.contract.blockers || [];
+    if (blockers.length) {
+      status.textContent = '실행 차단: ' + blockers.join(' ');
+      status.className = 'error';
+    } else {
+      const lock = inspected.contract.lockedCircuitLabel ? ' · 회로군: ' + inspected.contract.lockedCircuitLabel : '';
+      status.textContent = file.name + lock + ' · 데이터시트/PDK 계약을 확인했습니다.';
+      status.className = 'ready';
+    }
+  } catch (error) {
+    state.dataSheet = null;
+    state.dataSheetContract = { blockers: [error.message || '데이터시트 사전 검사를 완료하지 못했습니다.'] };
+    status.textContent = '데이터시트 검사 실패: ' + state.dataSheetContract.blockers[0];
+    status.className = 'error';
+    refreshRunAvailability();
+  }
 });
 
 document.querySelectorAll('.nav-item').forEach((button) => {
@@ -801,6 +881,26 @@ target('#circuit-input').addEventListener('change', () => {
   if (circuit === 'sar_adc') {
     showToast('SAR ADC는 검증된 서브블록 템플릿에서만 구성됩니다.');
   }
+  refreshRunAvailability();
+});
+
+target('[name="pdk"]').addEventListener('change', async () => {
+  if (!state.dataSheet) {
+    refreshRunAvailability();
+    return;
+  }
+  const status = target('#datasheet-status');
+  status.textContent = '선택한 PDK와 데이터시트의 호환성을 다시 검사 중입니다.';
+  try {
+    const inspected = await inspectDataSheet();
+    status.textContent = inspected.contract.valid
+      ? '데이터시트/PDK 계약을 확인했습니다.'
+      : '실행 차단: ' + inspected.contract.blockers.join(' ');
+    status.className = inspected.contract.valid ? 'ready' : 'error';
+  } catch (error) {
+    status.textContent = 'PDK 계약 검사 실패: ' + error.message;
+    status.className = 'error';
+  }
 });
 
 target('[name="naturalRequest"]').addEventListener('input', (event) => {
@@ -809,6 +909,7 @@ target('[name="naturalRequest"]').addEventListener('input', (event) => {
 });
 
 updateCircuitLabels();
+refreshRunAvailability();
 
 async function initialize() {
   try {

@@ -110,6 +110,8 @@ OpenRouter의 OpenAI-compatible Chat Completions API를 서버에서만 호출�
 
 결과 JSON의 `pdkProfile`, `retrieval.pdkScope`, `simulationAdapter`는 이 결정의 근거를 보여줍니다. 외부 PDK를 고르면 해당 모델·소자 vocabulary·simulator adapter가 설치되기 전까지 export가 차단됩니다.
 
+데이터시트를 선택하면 실행 전에 `/api/datasheet/inspect`가 회로군 분류, 공급전압 범위, PDK 적합성, 미매핑 measurement 항목을 검사합니다. 분류된 회로군과 드롭다운 선택이 다르거나, VDD가 데이터시트 범위를 벗어나거나, 현재 PDK가 해당 전력/수동소자 요구사항을 지원하지 않으면 실행 버튼과 서버 API가 함께 요청을 차단합니다.
+
 이 구조는 [agentic-analog-sizing](https://github.com/aprilaihub/agentic-analog-sizing)의 mock/real adapter 분리와 역할 기반 workflow, 그리고 [AaLLM](https://anonymous.4open.science/r/AaLLM/README.md)의 사양→토폴로지→사이징 폐루프를 참고해 독립적으로 구현했습니다. 외부 저장소 코드를 복사하거나 실행하지 않습니다.
 
 ## 주요 파일

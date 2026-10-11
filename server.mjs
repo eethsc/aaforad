@@ -464,6 +464,56 @@ export function normalizeInput(input = {}) {
   };
 }
 
+function dataSheetContract(spec, pdkProfile) {
+  const lockedCircuit = inferredDataSheetCircuit(spec.dataSheet);
+  const template = lockedCircuit ? TEMPLATE_LIBRARY[lockedCircuit] : null;
+  const requestedTemplate = spec.circuit !== 'auto' ? TEMPLATE_LIBRARY[spec.circuit] : null;
+  const supplyRules = (spec.dataSheet?.requirements || []).filter((item) => item.metric === 'supply');
+  const minimum = supplyRules.find((item) => item.operator === '>=')?.value ?? null;
+  const maximum = supplyRules.find((item) => item.operator === '<=')?.value ?? null;
+  const blockers = [];
+
+  if (pdkProfile.id === 'unconfigured-external-pdk') blockers.push('선택한 외부 PDK의 model file, device vocabulary, simulator adapter가 설정되지 않았습니다.');
+  if (lockedCircuit && spec.circuit !== 'auto' && spec.circuit !== lockedCircuit) {
+    blockers.push(`데이터시트는 ${TEMPLATE_LIBRARY[lockedCircuit].label} 회로군으로 분류되지만 ${spec.circuit}이 선택되었습니다.`);
+  }
+  if (requestedTemplate) {
+    const requestedCompatibility = pdkTemplateCompatibility(pdkProfile, requestedTemplate, spec);
+    if (!requestedCompatibility.compatible) blockers.push(...requestedCompatibility.reasons);
+  }
+  if (template) {
+    const compatibility = pdkTemplateCompatibility(pdkProfile, template, spec);
+    if (!compatibility.compatible) blockers.push(...compatibility.reasons);
+  }
+  if (minimum !== null && spec.supply < minimum) blockers.push(`VDD ${spec.supply} V가 데이터시트 최소 ${minimum} V보다 낮습니다.`);
+  if (maximum !== null && spec.supply > maximum) blockers.push(`VDD ${spec.supply} V가 데이터시트 최대 ${maximum} V보다 높습니다.`);
+
+  const unmapped = (spec.dataSheet?.requirements || []).filter((item) => item.unmapped);
+  if (unmapped.length) blockers.push(`데이터시트의 ${unmapped.length}개 사양에 결정론적 measurement adapter가 없습니다: ${unmapped.map((item) => item.metric).join(', ')}.`);
+  const uniqueBlockers = [...new Set(blockers)];
+
+  return {
+    valid: uniqueBlockers.length === 0,
+    blockers: uniqueBlockers,
+    lockedCircuit,
+    lockedCircuitLabel: lockedCircuit ? TEMPLATE_LIBRARY[lockedCircuit].label : null,
+    supplyRange: { minimum, maximum },
+    unmappedMetrics: unmapped.map((item) => item.metric),
+    pdk: { id: pdkProfile.id, label: pdkProfile.label }
+  };
+}
+
+function enforceInputContract(spec, pdkProfile) {
+  const contract = dataSheetContract(spec, pdkProfile);
+  if (!contract.valid) {
+    const error = new Error('설계 요청이 PDK 또는 데이터시트 계약을 충족하지 않습니다. ' + contract.blockers.join(' '));
+    error.statusCode = 422;
+    error.contract = contract;
+    throw error;
+  }
+  return contract;
+}
+
 function mergeExtractedSpec(spec, extracted = {}) {
   const aliases = ['supply', 'gainTarget', 'ugbwTarget', 'phaseTarget', 'powerTarget', 'noiseTarget', 'searchBudget'];
   const merged = { ...spec };
@@ -1469,6 +1519,7 @@ export async function runDesignCycle(rawInput = {}) {
   const dataSheet = await parseDataSheet(rawInput.dataSheet);
   const spec = { ...normalizeInput(rawInput), dataSheet };
   const pdkProfile = resolvePdkProfile(spec);
+  const inputContract = enforceInputContract(spec, pdkProfile);
   const lockedDataSheetCircuit = inferredDataSheetCircuit(dataSheet);
   const requestedTemplate = TEMPLATE_LIBRARY[lockedDataSheetCircuit]
     || TEMPLATE_LIBRARY[spec.circuit]
@@ -1500,6 +1551,12 @@ export async function runDesignCycle(rawInput = {}) {
     : { name: 'Architect', output: { circuit: requestedTemplate.id, rationale: 'test-only deterministic bypass', dataSheetLock: lockedDataSheetCircuit }, selectedTemplate: requestedTemplate };
   const template = architecture.selectedTemplate;
   const effectiveSpec = { ...mergeExtractedSpec(spec, architecture.output.extractedSpec), circuit: template.id };
+  const architectureCompatibility = pdkTemplateCompatibility(pdkProfile, template, effectiveSpec);
+  if (!architectureCompatibility.compatible) {
+    const error = new Error('선택된 회로군은 현재 PDK에서 지원되지 않습니다. ' + architectureCompatibility.reasons.join(' '));
+    error.statusCode = 422;
+    throw error;
+  }
   const specificationLedger = buildSpecLedger(effectiveSpec, architecture.output.specificationLedger, spec.naturalRequest);
   const knowledge = retrieveKnowledge(effectiveSpec, template, pdkProfile);
   const topologyPolicy = buildTopologyPolicy(template, effectiveSpec);
@@ -1582,6 +1639,7 @@ export async function runDesignCycle(rawInput = {}) {
       fabricationSafe: false
     },
     spec: effectiveSpec,
+    inputContract,
     pdkProfile: {
       id: pdkProfile.id,
       label: pdkProfile.label,
@@ -1751,6 +1809,21 @@ export function createApp() {
           llmConfigured: openRouterConfigured(),
           llmRequired: llmRequired(),
           cacheEntries: responseCache.size
+        });
+        return;
+      }
+      if (request.method === 'POST' && url.pathname === '/api/datasheet/inspect') {
+        const body = await readJsonBody(request);
+        const dataSheet = await parseDataSheet(body.dataSheet);
+        const spec = { ...normalizeInput(body), dataSheet };
+        const pdkProfile = resolvePdkProfile(spec);
+        sendJson(response, 200, {
+          dataSheet: {
+            fileName: dataSheet.fileName,
+            parser: dataSheet.parser,
+            requirements: dataSheet.requirements
+          },
+          contract: dataSheetContract(spec, pdkProfile)
         });
         return;
       }
