@@ -415,6 +415,9 @@ export function normalizeInput(input = {}) {
 
   return {
     circuit,
+    architectureMode: ['balanced', 'reliability', 'discovery'].includes(input.architectureMode)
+      ? input.architectureMode
+      : 'balanced',
     process: compactText(input.process, DEFAULT_INPUT.process, 80),
     supply: numberInRange(input.supply, DEFAULT_INPUT.supply, 0.6, 5),
     gainTarget: input.gainTarget === undefined ? DEFAULT_INPUT.gainTarget : optionalNumber(input.gainTarget, 20, 120),
@@ -617,8 +620,9 @@ function completeGrammarState(state, grammar, beamWidth) {
   return beam;
 }
 
-function buildCandidates(template, spec, seed, action = defaultSizingAction(template)) {
-  const grammar = topologyGrammar(template, clamp(Number(action.explorationBias) || 0, -0.2, 0.2));
+function buildCandidates(template, spec, seed, action = defaultSizingAction(template), architectureMode = 'balanced') {
+  const modeBias = architectureMode === 'discovery' ? 0.12 : architectureMode === 'reliability' ? -0.12 : 0;
+  const grammar = topologyGrammar(template, clamp((Number(action.explorationBias) || 0) + modeBias, -0.2, 0.2));
   const baseline = template.netlistKind === 'generic'
     ? ['interface:input', 'core:template', 'closure:feedback']
     : template.id === 'two_stage_ota'
@@ -662,7 +666,7 @@ function buildCandidates(template, spec, seed, action = defaultSizingAction(temp
     grammar[index].find((entry) => entry.id === token)?.prior || 0.5
   )) };
   results.set(baseline.join('|'), { state: baselineState, reward: rewardFor(baselineState) });
-  const candidates = [...results.values()].map((result, index) => {
+  let candidates = [...results.values()].map((result, index) => {
     const matching = result.state.tokens.join('|') === baseline.join('|');
     const trace = searchResult.frontier.find((entry) => entry.state.tokens.join('|') === result.state.tokens.join('|'));
     return {
@@ -670,6 +674,10 @@ function buildCandidates(template, spec, seed, action = defaultSizingAction(temp
       label: labelFor(result.state.tokens),
       templateMatch: matching ? 'validated template' : 'grammar-valid exploratory topology',
       exportable: matching,
+      track: matching ? 'production' : 'research',
+      promotionGate: matching
+        ? 'canonical template + PDG + symbolic oracle + simulation gate'
+        : 'requires interface-contract proof, generated testbench, symbolic/PDG pass, and physical SPICE measurement before canonicalization',
       prior: round(result.state.priors.reduce((sum, value) => sum + value, 0) / result.state.priors.length, 3),
       feasibility: round(result.reward, 3),
       visits: trace?.visits || 0,
@@ -678,8 +686,50 @@ function buildCandidates(template, spec, seed, action = defaultSizingAction(temp
       tokens: result.state.tokens
     };
   });
+  if (architectureMode === 'reliability') candidates = candidates.filter((candidate) => candidate.exportable);
   candidates.sort((left, right) => (left.exportable === right.exportable ? right.puctScore - left.puctScore : left.exportable ? -1 : 1));
   return { candidates, searchResult };
+}
+
+function buildHierarchicalPlan(template, spec, plannerAction) {
+  const groups = new Map();
+  for (const [role, label] of template.roles) {
+    const domain = /bias|reference|feedback/.test(role) ? 'bias-and-reference'
+      : /compensation|logic|clock/.test(role) ? 'stability-and-control'
+        : 'signal-path';
+    if (!groups.has(domain)) groups.set(domain, []);
+    groups.get(domain).push({ role, label });
+  }
+  return {
+    coordinator: 'LLM Planner',
+    strategy: '1+N coordinator/local-sizer decomposition',
+    selectedLocalOwner: plannerAction.targetRole,
+    partitions: [...groups].map(([id, roles]) => ({
+      id,
+      roles,
+      objective: id === 'signal-path' ? 'gain, bandwidth, noise'
+        : id === 'bias-and-reference' ? 'power, operating point, matching'
+          : 'stability, timing, phase margin'
+    })),
+    integrationGate: 'Coordinator may merge only bounded local actions; PDG and symbolic oracle own final acceptance.',
+    scale: template.roles.length >= 5 ? 'hierarchical required' : 'hierarchical available'
+  };
+}
+
+function buildTopologyPolicy(template, spec) {
+  const safetyCritical = ['sar_adc', 'ldo', 'buck_converter', 'charge_pump', 'pll'].includes(template.id);
+  const requested = spec.architectureMode;
+  return {
+    requested,
+    productionTrack: 'template-constrained composition',
+    researchTrack: requested === 'reliability' ? 'disabled by user policy' : 'grammar-bounded MCTS candidate discovery',
+    noveltyAllowed: requested !== 'reliability',
+    productionExportRule: 'Only canonical templates can export automatically. Exploratory candidates remain research artifacts until promoted by deterministic gates and physical SPICE measurement.',
+    safetyCritical,
+    rationale: safetyCritical
+      ? 'Safety/timing-sensitive circuit: discovery is isolated from the production export path.'
+      : 'Exploration and canonical delivery run in parallel, with deterministic promotion gates.'
+  };
 }
 
 function estimateMetrics(template, spec, seed, selectedCandidate, action = defaultSizingAction(template)) {
@@ -1319,20 +1369,20 @@ async function runOpenRouterArchitecture(spec, template, knowledge) {
   const catalog = Object.values(TEMPLATE_LIBRARY).map((entry) => ({ id: entry.id, label: entry.label, family: entry.family }));
   const result = await callOpenRouterAgent({
     name: 'Architect',
-    system: 'You are the Architect in an analog-circuit agent team. Use only GraphRAG evidence supplied by the server. Choose a constrained circuit family, never invent a SPICE netlist.',
-    prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
+    system: 'You are the Architect in an analog-circuit agent team. Use only GraphRAG evidence supplied by the server. Produce a functional decomposition and bounded topology hypotheses, never a SPICE netlist. Novelty is a research candidate only; deterministic gates control production export.',
+    prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\nArchitecture policy: ${spec.architectureMode} (reliability=canonical only, balanced=dual track, discovery=more research search).\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "functionalPartitions":["signal-path|bias-and-reference|stability-and-control"], "topologyHypotheses":["bounded grammar hint"], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
     schema: 'architecture-v1'
   });
   const selected = TEMPLATE_LIBRARY[result.output.circuit] || template;
   return { ...result, selectedTemplate: selected, output: { ...result.output, circuit: selected.id } };
 }
 
-async function runOpenRouterPlanner(spec, template, knowledge, architecture) {
+async function runOpenRouterPlanner(spec, template, knowledge, architecture, hierarchy) {
   const roles = template.roles.map(([id]) => id);
   const result = await callOpenRouterAgent({
     name: 'Planner',
-    system: 'You are the high-level Planner. Allocate exactly one functional role to a role-specific sizer. You may only return bounded scalar actions; topology and netlist remain locked.',
-    prompt: `Circuit: ${template.label}; allowed roles: ${roles.join(', ')}\nSpec: ${JSON.stringify(spec)}\nArchitect decision: ${JSON.stringify(architecture.output)}\nGraphRAG evidence: ${graphContext(knowledge)}\nReturn JSON {"summary":"string","targetRole":"one allowed role","deviceScale":0.8-1.25,"compensationScale":0.8-1.3,"explorationBias":-0.2..0.2,"knowledgeWrite":"reusable sizing heuristic"}.`,
+    system: 'You are the high-level 1+N Planner. Coordinate functional partitions and allocate exactly one role-specific sizer per turn. You may only return bounded scalar actions; MCTS proposes hypotheses and deterministic gates own topology acceptance.',
+    prompt: `Circuit: ${template.label}; allowed roles: ${roles.join(', ')}\nSpec: ${JSON.stringify(spec)}\nArchitect decision: ${JSON.stringify(architecture.output)}\nHierarchical plan: ${JSON.stringify(hierarchy)}\nGraphRAG evidence: ${graphContext(knowledge)}\nReturn JSON {"summary":"string","targetRole":"one allowed role","deviceScale":0.8-1.25,"compensationScale":0.8-1.3,"explorationBias":-0.2..0.2,"knowledgeWrite":"reusable sizing heuristic"}.`,
     schema: 'planner-v1'
   });
   const action = sanitizePlannerAction(result.output, template);
@@ -1401,11 +1451,14 @@ export async function runDesignCycle(rawInput = {}) {
   const effectiveSpec = { ...mergeExtractedSpec(spec, architecture.output.extractedSpec), circuit: template.id };
   const specificationLedger = buildSpecLedger(effectiveSpec, architecture.output.specificationLedger, spec.naturalRequest);
   const knowledge = retrieveKnowledge(effectiveSpec, template);
+  const topologyPolicy = buildTopologyPolicy(template, effectiveSpec);
+  const planningHierarchy = buildHierarchicalPlan(template, effectiveSpec, defaultSizingAction(template));
   const fallbackPlan = makePlannerFallback(template, effectiveSpec);
   const planner = llmRequired()
-    ? await runOpenRouterPlanner(effectiveSpec, template, knowledge, architecture)
+    ? await runOpenRouterPlanner(effectiveSpec, template, knowledge, architecture, planningHierarchy)
     : await optionalOpenAIPlanner(effectiveSpec, template, fallbackPlan);
-  const topologySearch = buildCandidates(template, effectiveSpec, cacheKey, planner.action);
+  const hierarchy = buildHierarchicalPlan(template, effectiveSpec, planner.action);
+  const topologySearch = buildCandidates(template, effectiveSpec, cacheKey, planner.action, effectiveSpec.architectureMode);
   const candidates = topologySearch.candidates;
   const selected = candidates.find((candidate) => candidate.status === 'selected') || candidates[0];
   let sizing = runAgenticSizingCycle(template, effectiveSpec, cacheKey, selected, planner.action, specificationLedger);
@@ -1449,7 +1502,7 @@ export async function runDesignCycle(rawInput = {}) {
           ? 'ngspice + PDK ready; measurement gated by failed requirements'
           : 'analytic surrogate (ngspice adapter unavailable)',
       llm: llmRequired()
-        ? 'OpenRouter Architect → Planner → Critic → Verifier loop completed'
+        ? 'OpenRouter Architect → 1+N Planner/Sizers → Critic → Verifier loop completed'
         : (planner.enabled ? 'legacy test adapter action applied' : 'test-only deterministic bypass'),
       evaluationCount: sizing.iterationHistory.length,
       simulationDiagnostics: simulation.diagnostics,
@@ -1458,11 +1511,11 @@ export async function runDesignCycle(rawInput = {}) {
     spec: effectiveSpec,
     dataSheet,
     planner,
-    agentLoop: { architecture, planner, critic, verifier, required: llmRequired(), provider: 'OpenRouter' },
+    agentLoop: { architecture, planner, critic, verifier, hierarchy, topologyPolicy, required: llmRequired(), provider: 'OpenRouter' },
     topology: buildTopology(template),
     candidates,
     search: {
-      algorithm: 'LM-prior PUCT MCTS + structured-token p-filter',
+      algorithm: 'dual-track LM-prior PUCT MCTS + structured-token p-filter',
       pFilterThreshold: 0.99,
       autoCommittedTokens: topologySearch.searchResult.autoCommittedTokens,
       searchBudget: spec.searchBudget,
@@ -1494,6 +1547,9 @@ export async function runDesignCycle(rawInput = {}) {
     verification: {
       topologyValid: true,
       templateConstrained: true,
+      topologyPolicy,
+      exploratoryCandidatesBlockedFromExport: candidates.filter((candidate) => candidate.track === 'research').length,
+      hierarchicalIntegration: hierarchy.integrationGate,
       numericalOracleEvaluated: symbolicOracle.available && symbolicOracle.allPassed,
       pdgValid: pdg.valid,
       allConstraintsPass: exportsAllowed,

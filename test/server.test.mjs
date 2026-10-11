@@ -66,12 +66,32 @@ test('runs a constrained OTA design cycle with verifiable artifacts', async () =
   assert.equal(result.retrieval.mode, 'local GraphRAG (evidence graph traversal)');
   assert.ok(result.retrieval.graph.graphStats.nodes > 0);
   assert.equal(result.sources.length, 5);
-  assert.equal(result.search.algorithm, 'LM-prior PUCT MCTS + structured-token p-filter');
+  assert.equal(result.search.algorithm, 'dual-track LM-prior PUCT MCTS + structured-token p-filter');
   assert.equal(result.topology.bipartiteMatrix.valid, true);
   assert.equal(result.topology.bipartiteMatrix.incidence.length, result.topology.edges.length);
   assert.equal(Number.isFinite(result.candidates[0].puctScore), true);
   assert.equal(result.candidates.filter((candidate) => candidate.status === 'selected').length, 1);
   assert.equal(result.candidates.find((candidate) => candidate.status === 'selected').exportable, true);
+  assert.equal(result.agentLoop.hierarchy.strategy, '1+N coordinator/local-sizer decomposition');
+  assert.equal(result.verification.topologyPolicy.productionTrack, 'template-constrained composition');
+  assert.ok(result.candidates.some((candidate) => candidate.track === 'research'));
+});
+
+test('reliability mode disables exploratory topology candidates but retains hierarchical deterministic gates', async () => {
+  const result = await runDesignCycle({
+    circuit: 'two_stage_ota',
+    architectureMode: 'reliability',
+    gainTarget: 62,
+    ugbwTarget: 28,
+    phaseTarget: 62,
+    powerTarget: 1.2,
+    noiseTarget: 38
+  });
+  assert.equal(result.spec.architectureMode, 'reliability');
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].track, 'production');
+  assert.equal(result.verification.topologyPolicy.noveltyAllowed, false);
+  assert.match(result.verification.hierarchicalIntegration, /PDG and symbolic oracle/);
 });
 
 test('blocks artifacts when local feasibility constraints fail', async () => {
