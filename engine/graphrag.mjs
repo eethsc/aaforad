@@ -61,9 +61,24 @@ export function queryResearchGraph(graph, query, limit = 6) {
   return {
     queryTerms,
     nodes: [...selected.values()].sort((a, b) => b.score - a.score).slice(0, limit).map(({ node, score: nodeScore }) => ({
-      id: node.id, type: node.type, title: node.title, evidence: node.text.slice(0, 420), score: nodeScore
+      id: node.id, type: node.type, title: node.title, evidence: node.text.slice(0, 420), score: nodeScore, selected: true
     })),
     paths: paths.slice(0, 10),
-    graphStats: { nodes: graph.nodes.length, edges: graph.edges.length }
+    graphStats: { nodes: graph.nodes.length, edges: graph.edges.length },
+    fullGraph: {
+      nodes: graph.nodes.map((node) => ({
+        id: node.id,
+        type: node.type,
+        title: node.title,
+        selected: selected.has(node.id),
+        score: score(node)
+      })),
+      edges: graph.edges.map((edge) => ({
+        from: edge.from,
+        to: edge.to,
+        type: edge.type,
+        active: selected.has(edge.from) && selected.has(edge.to)
+      }))
+    }
   };
 }

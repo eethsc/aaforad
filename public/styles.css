@@ -849,6 +849,37 @@ select:focus-visible {
   background-size: 16px 16px;
 }
 
+.circuit-empty-placeholder {
+  height: 100%;
+  min-height: 330px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 30px;
+  color: #6a828e;
+}
+
+.circuit-empty-icon {
+  font-size: 34px;
+  color: var(--mint);
+  margin-bottom: 12px;
+  opacity: 0.85;
+  filter: drop-shadow(0 2px 8px rgba(0, 184, 150, 0.2));
+}
+
+.circuit-empty-placeholder p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #5c7480;
+}
+
+.circuit-empty-placeholder strong {
+  color: var(--mint-dark);
+}
+
 .circuit-svg {
   width: 100%;
   height: 100%;
@@ -1890,3 +1921,290 @@ body.light-theme .topbar {
     flex-direction: column;
   }
 }
+
+/* ==========================================================================
+   ENHANCED SESSIONS, PDG GRAPH, AND GRAPHRAG VISUALIZATION STYLES
+   ========================================================================== */
+
+.section-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.icon-small-btn {
+  background: rgba(0, 184, 150, 0.12);
+  border: 1px solid rgba(0, 184, 150, 0.3);
+  color: var(--mint);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.icon-small-btn:hover {
+  background: var(--mint);
+  color: #03101c;
+}
+
+.session-list {
+  display: grid;
+  gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.session-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 160ms ease;
+}
+
+.session-card:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(0, 184, 150, 0.3);
+}
+
+.session-card.selected {
+  background: rgba(0, 184, 150, 0.12);
+  border-color: var(--mint);
+  box-shadow: inset 2px 0 0 var(--mint);
+}
+
+.session-card-content {
+  display: grid;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.session-card-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #e2eff5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-card-meta {
+  font-size: 9px;
+  color: #7191a2;
+  font-family: var(--mono);
+}
+
+.session-delete-btn {
+  background: transparent;
+  border: none;
+  color: #557283;
+  padding: 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  opacity: 0.6;
+  transition: all 150ms ease;
+}
+
+.session-delete-btn:hover {
+  color: #ff6b6b;
+  opacity: 1;
+  background: rgba(255, 107, 107, 0.1);
+}
+
+/* PDG Interactive Dependency Graph Canvas */
+.pdg-graph-box {
+  margin-top: 18px;
+  padding: 14px;
+  background: rgba(4, 15, 26, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+}
+
+.graph-box-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  color: #8daec0;
+  margin-bottom: 12px;
+}
+
+.pdg-svg-canvas {
+  width: 100%;
+  height: 220px;
+  background: radial-gradient(circle at 50% 50%, rgba(10, 167, 137, 0.04) 0%, rgba(2, 6, 23, 0.8) 100%);
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+}
+
+.pdg-node {
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.pdg-node:hover rect {
+  stroke: var(--mint);
+  stroke-width: 2px;
+}
+
+.pdg-node-text {
+  font-family: var(--mono);
+  font-size: 10px;
+  fill: #e2f5f1;
+  pointer-events: none;
+}
+
+.pdg-node-kind {
+  font-family: var(--mono);
+  font-size: 8px;
+  fill: #61879c;
+  pointer-events: none;
+}
+
+.pdg-edge {
+  stroke: rgba(141, 174, 192, 0.25);
+  stroke-width: 1.5px;
+  fill: none;
+  marker-end: url(#pdg-arrow);
+}
+
+.pdg-edge.active {
+  stroke: var(--mint);
+  stroke-width: 2px;
+}
+
+/* GraphRAG Knowledge Base Visualizer */
+.graphrag-visualizer {
+  margin-bottom: 20px;
+  padding: 16px;
+  background: rgba(4, 15, 26, 0.7);
+  border: 1px solid rgba(0, 184, 150, 0.2);
+  border-radius: 12px;
+}
+
+.graphrag-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.graphrag-legend {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.legend-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #a4c0d1;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot.paper { background: #3b82f6; box-shadow: 0 0 8px rgba(59, 130, 246, 0.5); }
+.dot.claim { background: #8b5cf6; box-shadow: 0 0 8px rgba(139, 92, 246, 0.4); }
+.dot.active { background: #22c55e; box-shadow: 0 0 10px rgba(34, 197, 94, 0.7); }
+
+.graph-stats-chip {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 3px 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  color: #6ed1be;
+}
+
+.graphrag-svg-container {
+  width: 100%;
+  height: 320px;
+  background: radial-gradient(circle at center, rgba(15, 23, 42, 0.9) 0%, #020617 100%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.rag-node {
+  cursor: pointer;
+  transition: transform 150ms ease;
+}
+
+.rag-node:hover circle {
+  stroke: #ffffff;
+  stroke-width: 2.5px;
+}
+
+.rag-node-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  fill: #cbd5e1;
+  pointer-events: none;
+}
+
+.rag-edge {
+  stroke: rgba(148, 163, 184, 0.15);
+  stroke-width: 1px;
+}
+
+.rag-edge.highlighted {
+  stroke: #22c55e;
+  stroke-width: 2px;
+  opacity: 0.8;
+}
+
+.graphrag-traversal-paths {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.traversal-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-family: var(--mono);
+  background: rgba(255, 255, 255, 0.02);
+  padding: 6px 10px;
+  border-radius: 6px;
+  border-left: 3px solid #3b82f6;
+  color: #94a3b8;
+}
+
+.traversal-step.active {
+  border-left-color: #22c55e;
+  color: #f1f5f9;
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.traversal-rel {
+  font-size: 9px;
+  color: #64748b;
+  text-transform: uppercase;
+}
+

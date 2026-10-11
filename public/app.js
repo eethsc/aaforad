@@ -59,6 +59,7 @@ async function fileAsBase64(file) {
 async function formPayload() {
   const values = new FormData(form);
   const payload = Object.fromEntries(values.entries());
+  payload.sessionId = state.sessionId;
   delete payload.dataSheet;
   if (state.dataSheet) {
     payload.dataSheet = {
@@ -147,26 +148,34 @@ function renderTopology(topology) {
 function metricDefinitions(result) {
   const spec = result.spec;
   const metrics = result.metrics;
+  const fmtTarget = (val, op, unit) => val !== null && val !== undefined ? `${op} ${val} ${unit}` : 'unconstrained';
+  const passCheck = (actual, targetVal, isMax) => {
+    if (targetVal === null || targetVal === undefined) return true;
+    return isMax ? actual <= targetVal : actual >= targetVal;
+  };
+
   if (result.topology.id === 'sar_adc') {
     return [
       { label: 'SNR', value: metrics.snr, unit: 'dB', target: 'dynamic range proxy', pass: true, decimals: 2 },
       { label: 'ENOB', value: metrics.enob, unit: 'bits', target: 'target 8 bits', pass: metrics.enob >= 7.5, decimals: 2 },
-      { label: 'Decision speed', value: metrics.ugbw, unit: 'MHz', target: '≥ ' + spec.ugbwTarget + ' MHz', pass: metrics.ugbw >= spec.ugbwTarget, decimals: 2 },
-      { label: 'Power', value: metrics.power, unit: 'mW', target: '≤ ' + spec.powerTarget + ' mW', pass: metrics.power <= spec.powerTarget, decimals: 3 },
-      { label: 'Input noise', value: metrics.noise, unit: 'nV/√Hz', target: '≤ ' + spec.noiseTarget + ' nV/√Hz', pass: metrics.noise <= spec.noiseTarget, decimals: 2 }
+      { label: 'Decision speed', value: metrics.ugbw, unit: 'MHz', target: fmtTarget(spec.ugbwTarget, '≥', 'MHz'), pass: passCheck(metrics.ugbw, spec.ugbwTarget, false), decimals: 2 },
+      { label: 'Power', value: metrics.power, unit: 'mW', target: fmtTarget(spec.powerTarget, '≤', 'mW'), pass: passCheck(metrics.power, spec.powerTarget, true), decimals: 3 },
+      { label: 'Input noise', value: metrics.noise, unit: 'nV/√Hz', target: fmtTarget(spec.noiseTarget, '≤', 'nV/√Hz'), pass: passCheck(metrics.noise, spec.noiseTarget, true), decimals: 2 }
     ];
   }
   return [
-    { label: 'DC gain', value: metrics.gain, unit: 'dB', target: '≥ ' + spec.gainTarget + ' dB', pass: metrics.gain >= spec.gainTarget, decimals: 1 },
-    { label: 'UGBW', value: metrics.ugbw, unit: 'MHz', target: '≥ ' + spec.ugbwTarget + ' MHz', pass: metrics.ugbw >= spec.ugbwTarget, decimals: 2 },
-    { label: 'Phase margin', value: metrics.phase, unit: '°', target: '≥ ' + spec.phaseTarget + '°', pass: metrics.phase >= spec.phaseTarget, decimals: 1 },
-    { label: 'Power', value: metrics.power, unit: 'mW', target: '≤ ' + spec.powerTarget + ' mW', pass: metrics.power <= spec.powerTarget, decimals: 3 },
-    { label: 'Input noise', value: metrics.noise, unit: 'nV/√Hz', target: '≤ ' + spec.noiseTarget + ' nV/√Hz', pass: metrics.noise <= spec.noiseTarget, decimals: 2 }
+    { label: 'DC gain', value: metrics.gain, unit: 'dB', target: fmtTarget(spec.gainTarget, '≥', 'dB'), pass: passCheck(metrics.gain, spec.gainTarget, false), decimals: 1 },
+    { label: 'UGBW', value: metrics.ugbw, unit: 'MHz', target: fmtTarget(spec.ugbwTarget, '≥', 'MHz'), pass: passCheck(metrics.ugbw, spec.ugbwTarget, false), decimals: 2 },
+    { label: 'Phase margin', value: metrics.phase, unit: '°', target: fmtTarget(spec.phaseTarget, '≥', '°'), pass: passCheck(metrics.phase, spec.phaseTarget, false), decimals: 1 },
+    { label: 'Power', value: metrics.power, unit: 'mW', target: fmtTarget(spec.powerTarget, '≤', 'mW'), pass: passCheck(metrics.power, spec.powerTarget, true), decimals: 3 },
+    { label: 'Input noise', value: metrics.noise, unit: 'nV/√Hz', target: fmtTarget(spec.noiseTarget, '≤', 'nV/√Hz'), pass: passCheck(metrics.noise, spec.noiseTarget, true), decimals: 2 }
   ];
 }
 
 function renderMetrics(result) {
-  target('#metrics-grid').innerHTML = metricDefinitions(result).map((metric) => (
+  const grid = target('#metrics-grid');
+  if (!grid) return;
+  grid.innerHTML = metricDefinitions(result).map((metric) => (
     '<article class="metric-card">'
       + '<div class="metric-label">' + escapeHtml(metric.label) + '</div>'
       + '<div class="metric-value">' + metricText(metric.value, metric.unit, metric.decimals) + '</div>'
@@ -175,13 +184,18 @@ function renderMetrics(result) {
       + (metric.pass ? '● constraint met' : '● review required') + '</div>'
     + '</article>'
   )).join('');
-  target('#cache-label').innerHTML = result.cache.hit
-    ? '<span>◉</span> cache hit · ' + result.cache.savedEvaluations + '개 최적화 평가 재사용'
-    : '<span>●</span> ' + result.mode.simulator + ' · cache key ' + result.cache.key;
+  const cacheLabel = target('#cache-label');
+  if (cacheLabel) {
+    cacheLabel.innerHTML = result.cache.hit
+      ? '<span>◉</span> cache hit · ' + result.cache.savedEvaluations + '개 최적화 평가 재사용'
+      : '<span>●</span> ' + result.mode.simulator + ' · cache key ' + result.cache.key;
+  }
 }
 
 function renderPipeline(result) {
-  target('#agent-pipeline').innerHTML = result.agents.map((agent) => (
+  const container = target('#agent-pipeline');
+  if (!container) return;
+  container.innerHTML = result.agents.map((agent) => (
     '<article class="agent-step ' + (agent.state === 'attention' ? 'attention' : '') + '">'
       + '<div class="agent-step-icon">' + stageGlyph(agent.id) + '</div>'
       + '<strong>' + escapeHtml(agent.label) + '</strong>'
@@ -194,12 +208,16 @@ function renderPipeline(result) {
     ? ' · 적용 action: ' + action.targetRole + ' / device ×' + action.deviceScale
       + ' / comp ×' + action.compensationScale
     : '';
-  target('#planner-text').textContent = result.planner.text + actionSuffix;
-  target('#iteration-pill').textContent = result.iterationHistory.length + ' optimization records';
+  const plannerText = target('#planner-text');
+  if (plannerText) plannerText.textContent = result.planner.text + actionSuffix;
+  const iterationPill = target('#iteration-pill');
+  if (iterationPill) iterationPill.textContent = result.iterationHistory.length + ' optimization records';
 }
 
 function renderCandidates(result) {
-  target('#candidate-list').innerHTML = result.candidates.map((candidate) => (
+  const container = target('#candidate-list');
+  if (!container) return;
+  container.innerHTML = result.candidates.map((candidate) => (
     '<article class="candidate-row ' + (candidate.status === 'selected' ? 'selected' : '') + '">'
       + '<div class="candidate-name">'
       + '<strong>' + escapeHtml(candidate.label) + '</strong>'
@@ -209,8 +227,11 @@ function renderCandidates(result) {
       + '<span>' + (candidate.status === 'selected' ? 'SELECTED' : candidate.status.toUpperCase()) + '</span></div>'
       + '</article>'
   )).join('');
-  target('#filter-stat').textContent = result.search.autoCommittedTokens.length + ' auto-committed / '
-    + result.search.searchBudget + ' search steps';
+  const filterStat = target('#filter-stat');
+  if (filterStat) {
+    filterStat.textContent = result.search.autoCommittedTokens.length + ' auto-committed / '
+      + result.search.searchBudget + ' search steps';
+  }
 }
 
 function renderVerification(result) {
@@ -311,6 +332,144 @@ function renderArtifact() {
   });
 }
 
+function renderPdgGraph(pdg, specCoverage) {
+  const canvas = target('#pdg-svg-canvas');
+  if (!canvas || !pdg || !pdg.nodes) return;
+  const nodes = pdg.nodes;
+  const edges = pdg.edges || [];
+  const width = canvas.clientWidth || 600;
+  const height = 220;
+
+  // Layout nodes along layers or topologicalOrder
+  const orderMap = new Map((pdg.topologicalOrder || []).map((id, index) => [id, index]));
+  const cols = Math.min(6, Math.max(3, Math.ceil(nodes.length / 3)));
+  const rows = Math.ceil(nodes.length / cols);
+  const colSpacing = (width - 70) / Math.max(1, cols - 1);
+  const rowSpacing = (height - 60) / Math.max(1, rows - 1);
+
+  const nodePositions = new Map();
+  nodes.forEach((node, idx) => {
+    const col = idx % cols;
+    const row = Math.floor(idx / cols);
+    const x = 35 + col * colSpacing;
+    const y = 30 + row * rowSpacing;
+    nodePositions.set(node.id, { x, y, node });
+  });
+
+  const arrowDef = '<defs><marker id="pdg-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 1 L 9 5 L 0 9 z" fill="#00b896" /></marker></defs>';
+
+  const renderedEdges = edges.map((edge) => {
+    const from = nodePositions.get(edge.from);
+    const to = nodePositions.get(edge.to);
+    if (!from || !to) return '';
+    const active = edge.type === 'depends-on';
+    return `<path class="pdg-edge ${active ? 'active' : ''}" d="M ${from.x} ${from.y} L ${to.x} ${to.y}" />`;
+  }).join('');
+
+  const renderedNodes = nodes.map((node) => {
+    const pos = nodePositions.get(node.id);
+    if (!pos) return '';
+    const isAssertion = node.kind === 'assertion';
+    const isAnalysis = node.kind === 'analysis';
+    const rectColor = isAssertion ? 'rgba(227, 179, 65, 0.2)' : isAnalysis ? 'rgba(59, 130, 246, 0.2)' : 'rgba(0, 184, 150, 0.2)';
+    const strokeColor = isAssertion ? '#e3b341' : isAnalysis ? '#3b82f6' : '#00b896';
+    const title = escapeHtml(node.id.replace(/_/g, ' '));
+    const label = escapeHtml((node.metric || node.kind || '').slice(0, 12));
+
+    return `<g class="pdg-node" transform="translate(${pos.x - 42}, ${pos.y - 16})">
+      <rect width="84" height="32" rx="6" fill="${rectColor}" stroke="${strokeColor}" stroke-width="1.2" />
+      <text class="pdg-node-text" x="42" y="14" text-anchor="middle">${title.slice(0, 14)}</text>
+      <text class="pdg-node-kind" x="42" y="25" text-anchor="middle">${label}</text>
+    </g>`;
+  }).join('');
+
+  canvas.innerHTML = `<svg width="100%" height="100%" viewBox="0 0 ${width} ${height}">${arrowDef}${renderedEdges}${renderedNodes}</svg>`;
+  target('#pdg-graph-meta').textContent = (specCoverage?.complete ? '✓ 전 사양 매핑 완료' : '⚠ 미매핑 사양 존재') + ` (${nodes.length} nodes · ${edges.length} edges)`;
+}
+
+function renderKnowledgeGraph(retrieval) {
+  const container = target('#graphrag-canvas');
+  const pathsContainer = target('#graphrag-paths');
+  if (!container || !retrieval) return;
+
+  const graph = retrieval.graph;
+  if (!graph || !graph.fullGraph) return;
+
+  const fullNodes = graph.fullGraph.nodes || [];
+  const fullEdges = graph.fullGraph.edges || [];
+  const width = container.clientWidth || 600;
+  const height = 320;
+
+  target('#graphrag-stats-chip').textContent = `${graph.graphStats.nodes} Nodes · ${graph.graphStats.edges} Edges · ${graph.queryTerms.length} 쿼리 키워드`;
+
+  // Circular layout grouped by type: papers in inner circle, claims in outer circle
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const paperRadius = Math.min(width, height) * 0.24;
+  const claimRadius = Math.min(width, height) * 0.42;
+
+  const papers = fullNodes.filter((n) => n.type === 'paper');
+  const claims = fullNodes.filter((n) => n.type === 'claim');
+
+  const positions = new Map();
+
+  papers.forEach((p, idx) => {
+    const angle = (2 * Math.PI * idx) / Math.max(1, papers.length);
+    positions.set(p.id, {
+      x: centerX + paperRadius * Math.cos(angle),
+      y: centerY + paperRadius * Math.sin(angle),
+      node: p
+    });
+  });
+
+  claims.forEach((c, idx) => {
+    const angle = (2 * Math.PI * idx) / Math.max(1, claims.length);
+    positions.set(c.id, {
+      x: centerX + claimRadius * Math.cos(angle),
+      y: centerY + claimRadius * Math.sin(angle),
+      node: c
+    });
+  });
+
+  const renderedEdges = fullEdges.map((edge) => {
+    const from = positions.get(edge.from);
+    const to = positions.get(edge.to);
+    if (!from || !to) return '';
+    const active = edge.active;
+    return `<line class="rag-edge ${active ? 'highlighted' : ''}" x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" />`;
+  }).join('');
+
+  const renderedNodes = fullNodes.map((node) => {
+    const pos = positions.get(node.id);
+    if (!pos) return '';
+    const isPaper = node.type === 'paper';
+    const isSelected = node.selected;
+    const r = isSelected ? (isPaper ? 14 : 9) : (isPaper ? 9 : 5.5);
+    const fill = isSelected ? '#22c55e' : (isPaper ? '#3b82f6' : '#8b5cf6');
+    const stroke = isSelected ? '#ffffff' : 'rgba(255, 255, 255, 0.4)';
+    const strokeWidth = isSelected ? 2.5 : 1;
+    const label = escapeHtml(node.title.replace(/###\s*2\.\d*\.?\s*/g, '').slice(0, 16));
+
+    return `<g class="rag-node" transform="translate(${pos.x}, ${pos.y})" title="${escapeHtml(node.title)}">
+      <circle r="${r}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" />
+      ${(isPaper || isSelected) ? `<text class="rag-node-label" y="${r + 11}" text-anchor="middle">${label}</text>` : ''}
+    </g>`;
+  }).join('');
+
+  container.innerHTML = `<svg width="100%" height="100%" viewBox="0 0 ${width} ${height}">${renderedEdges}${renderedNodes}</svg>`;
+
+  if (pathsContainer) {
+    const paths = graph.paths || [];
+    pathsContainer.innerHTML = paths.slice(0, 6).map((p) => (
+      `<div class="traversal-step active">
+        <span>🔗 ${escapeHtml(p.from.replace(/###\s*2\.\d*\.?\s*/g, ''))}</span>
+        <span class="traversal-rel">${escapeHtml(p.relation)}</span>
+        <span>${escapeHtml(p.to.slice(0, 36))}</span>
+      </div>`
+    )).join('');
+  }
+}
+
 function renderAll(result) {
   state.result = result;
   renderTopology(result.topology);
@@ -318,39 +477,67 @@ function renderAll(result) {
   renderPipeline(result);
   renderCandidates(result);
   renderVerification(result);
+  renderPdgGraph(result.pdg, result.specCoverage);
   renderTrace(result.iterationHistory);
   renderSources(result.sources, result.retrieval);
+  renderKnowledgeGraph(result.retrieval);
   renderArtifact();
-  target('#session-meta').textContent = result.mode.llm;
-  target('#session-title').textContent = result.dataSheet
+  refreshSessions();
+  const sessionTitle = result.dataSheet
     ? result.dataSheet.fileName.replace(/\.[^.]+$/, '')
     : result.topology.shortLabel + ' · ' + result.topology.family;
+  const sessionTitleEl = target('#session-title');
+  if (sessionTitleEl) sessionTitleEl.textContent = sessionTitle;
+  const sessionMetaEl = target('#session-meta');
+  if (sessionMetaEl) sessionMetaEl.textContent = result.mode?.llm || 'local estimator';
+  const breadcrumbCategory = target('#breadcrumb-category');
+  if (breadcrumbCategory) breadcrumbCategory.textContent = result.topology.family || 'Workspace';
+  const breadcrumbTitle = target('#breadcrumb-title');
+  if (breadcrumbTitle) breadcrumbTitle.textContent = result.topology.label || sessionTitle;
   if (result.dataSheet) {
     const status = target('#datasheet-status');
-    status.textContent = result.dataSheet.fileName + ' · ' + result.dataSheet.requirements.length
-      + '개 사양 추출 · ' + result.dataSheet.parser + ' · hash ' + result.dataSheet.sha256;
-    status.className = 'ready';
+    if (status) {
+      status.textContent = result.dataSheet.fileName + ' · ' + result.dataSheet.requirements.length
+        + '개 사양 추출 · ' + result.dataSheet.parser + ' · hash ' + result.dataSheet.sha256;
+      status.className = 'ready';
+    }
   }
 }
 
 function clearResults() {
   target('#metrics-grid').innerHTML = Array.from({ length: 5 }, () => '<div class="metric-card skeleton-card"></div>').join('');
-  target('#candidate-list').innerHTML = '';
+  const candidateList = target('#candidate-list');
+  if (candidateList) candidateList.innerHTML = '';
   target('#constraint-list').innerHTML = '';
   target('#pdg-flow').innerHTML = '';
   target('#chart-wrap').innerHTML = '';
-  target('#agent-pipeline').innerHTML = '';
+  const agentPipeline = target('#agent-pipeline');
+  if (agentPipeline) agentPipeline.innerHTML = '';
+  target('#circuit-stage').innerHTML = `
+    <div class="circuit-empty-placeholder">
+      <div class="circuit-empty-icon">⚡</div>
+      <p>회로 유형과 사양을 입력한 후 <strong>'에이전트 설계 실행'</strong>을 누르면<br>검증된 넷리스트 토폴로지가 여기에 시각화됩니다.</p>
+    </div>`;
+  target('#topology-title').textContent = '회로 토폴로지 대기 중';
+  target('#topology-summary').textContent = '설계를 실행하면 선택된 회로군의 템플릿과 그래프가 렌더링됩니다.';
+  target('#matrix-tag').textContent = 'B ∈ Rⁿˣᵐ · awaiting run';
   target('#artifact-code').textContent = '실행 후 템플릿 제약 넷리스트가 이곳에 표시됩니다.';
   target('#download-netlist-button').disabled = false;
   target('#cache-label').innerHTML = '<span>◌</span> 아직 실행되지 않음';
-  target('#iteration-pill').textContent = '0 optimization records';
+  const iterationPill = target('#iteration-pill');
+  if (iterationPill) iterationPill.textContent = '0 optimization records';
   target('#verification-status').textContent = '대기';
   target('#verification-status').classList.remove('pass');
   target('#repair-callout').className = 'repair-callout';
+  const breadcrumbCategory = target('#breadcrumb-category');
+  if (breadcrumbCategory) breadcrumbCategory.textContent = 'Workspace';
+  const breadcrumbTitle = target('#breadcrumb-title');
+  if (breadcrumbTitle) breadcrumbTitle.textContent = '대기 중';
 }
 
 function startRunAnimation() {
   const pipeline = target('#agent-pipeline');
+  if (!pipeline) return;
   pipeline.innerHTML = ['Grounding', 'Topology search', 'Role sizing', 'Critic loop', 'Verifier'].map((label, index) => (
     '<article class="agent-step"><div class="agent-step-icon" style="animation: sheen 1.2s linear infinite">' + (index + 1) + '</div>'
       + '<strong>' + label + '</strong><small>running...</small><div class="agent-state">ACTIVE</div></article>'
@@ -404,7 +591,7 @@ async function bootstrap() {
   } catch {
     target('#runtime-chip').innerHTML = '<i></i> local server offline';
   }
-  await runDesign();
+  // Auto-run removed: wait for explicit user click or keypress
 }
 
 form.addEventListener('submit', runDesign);
@@ -458,23 +645,114 @@ target('#fit-circuit-button').addEventListener('click', () => {
   showToast('캔버스를 전체 토폴로지에 맞췄습니다.');
 });
 
-target('#new-session-button').addEventListener('click', () => {
-  form.reset();
-  state.sessionId = globalThis.crypto?.randomUUID?.() || String(Date.now());
-  state.dataSheet = null;
+async function refreshSessions() {
+  const container = target('#session-list');
+  if (!container) return;
+  try {
+    const data = await fetchJson('/api/sessions');
+    const sessions = data.sessions || [];
+    container.innerHTML = sessions.map((sess) => {
+      const isSelected = sess.id === state.sessionId;
+      return `<div class="session-card ${isSelected ? 'selected' : ''}" data-session-id="${escapeHtml(sess.id)}">
+        <div class="session-card-content">
+          <span class="session-card-title">${escapeHtml(sess.title)}</span>
+          <span class="session-card-meta">${escapeHtml(sess.meta)}</span>
+        </div>
+        ${sessions.length > 1 ? `<button class="session-delete-btn" data-delete-id="${escapeHtml(sess.id)}" title="세션 삭제">×</button>` : ''}
+      </div>`;
+    }).join('');
+
+    container.querySelectorAll('.session-card').forEach((card) => {
+      card.addEventListener('click', (e) => {
+        if (e.target.closest('.session-delete-btn')) return;
+        const id = card.dataset.sessionId;
+        const targetSession = sessions.find((s) => s.id === id);
+        if (targetSession) selectSession(targetSession);
+      });
+    });
+
+    container.querySelectorAll('.session-delete-btn').forEach((btn) => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.deleteId;
+        await fetchJson('/api/sessions/' + id, { method: 'DELETE' });
+        showToast('세션을 삭제했습니다.');
+        if (state.sessionId === id) {
+          const remaining = sessions.filter((s) => s.id !== id);
+          if (remaining[0]) selectSession(remaining[0]);
+          else createNewSession();
+        } else {
+          await refreshSessions();
+        }
+      });
+    });
+  } catch (e) {
+    console.error('Failed to load sessions', e);
+  }
+}
+
+function selectSession(sess) {
+  state.sessionId = sess.id;
+  const titleEl = target('#session-title');
+  if (titleEl) titleEl.textContent = sess.title;
+  const metaEl = target('#session-meta');
+  if (metaEl) metaEl.textContent = sess.meta;
+  if (sess.circuit) target('#circuit-input').value = sess.circuit;
   updateCircuitLabels();
-  state.result = null;
-  state.artifact = 'netlist';
-  target('#datasheet-input').value = '';
-  target('#datasheet-status').textContent = '파일을 선택하면 서버가 텍스트를 추출하고, 사양 ledger·PDG assertion에 원문 근거로 추가합니다. 7 MB 이하.';
-  target('#datasheet-status').className = '';
-  target('#session-title').textContent = '새 설계 세션';
-  target('#session-meta').textContent = 'session ' + state.sessionId.slice(0, 8);
-  clearResults();
-  target('#workbench').scrollIntoView({ behavior: 'smooth', block: 'start' });
-  setRunStatus('새 설계 세션', '사양을 조정한 뒤 에이전트 설계를 실행하세요.', false);
-  showToast('새 설계 사양으로 초기화했습니다.');
-});
+  if (sess.result) {
+    renderAll(sess.result);
+    showToast(`'${sess.title}' 세션을 로드했습니다.`);
+  } else {
+    clearResults();
+    const breadcrumbCategory = target('#breadcrumb-category');
+    if (breadcrumbCategory) breadcrumbCategory.textContent = 'Session';
+    const breadcrumbTitle = target('#breadcrumb-title');
+    if (breadcrumbTitle) breadcrumbTitle.textContent = sess.title;
+    showToast(`새 세션 '${sess.title}'(으)로 전환했습니다.`);
+  }
+  refreshSessions();
+}
+
+async function createNewSession() {
+  const newId = globalThis.crypto?.randomUUID?.() || String(Date.now());
+  const newTitle = '세션 ' + (document.querySelectorAll('.session-card').length + 1) + ' · ' + target('#circuit-input').value;
+  try {
+    const created = await fetchJson('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: newId,
+        title: newTitle,
+        meta: 'local custom sandbox',
+        circuit: target('#circuit-input').value
+      })
+    });
+    form.reset();
+    state.sessionId = created.id;
+    state.dataSheet = null;
+    state.result = null;
+    state.artifact = 'netlist';
+    target('#datasheet-input').value = '';
+    const dsStatus = target('#datasheet-status');
+    if (dsStatus) {
+      dsStatus.textContent = '파일을 선택하면 서버가 텍스트를 추출하고, 사양 ledger·PDG assertion에 원문 근거로 추가합니다. 7 MB 이하.';
+      dsStatus.className = '';
+    }
+    const sessionTitleEl = target('#session-title');
+    if (sessionTitleEl) sessionTitleEl.textContent = created.title;
+    const sessionMetaEl = target('#session-meta');
+    if (sessionMetaEl) sessionMetaEl.textContent = created.meta;
+    clearResults();
+    updateCircuitLabels();
+    await refreshSessions();
+    setRunStatus('새 설계 세션', '사양을 조정한 뒤 에이전트 설계를 실행하세요.', false);
+    showToast('새 설계 세션을 생성했습니다.');
+  } catch (err) {
+    showToast('세션 생성 오류: ' + err.message);
+  }
+}
+
+target('#new-session-button').addEventListener('click', createNewSession);
 
 target('#datasheet-input').addEventListener('change', (event) => {
   const file = event.target.files?.[0] || null;
@@ -519,4 +797,6 @@ target('[name="naturalRequest"]').addEventListener('input', (event) => {
 });
 
 updateCircuitLabels();
+refreshSessions();
 bootstrap();
+

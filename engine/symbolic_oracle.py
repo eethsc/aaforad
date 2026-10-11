@@ -14,13 +14,17 @@ phase = sp.Float(metrics.get("phase", 0))
 power = sp.Float(metrics.get("power", 0))
 noise = sp.Float(metrics.get("noise", 0))
 
-checks = [
-    ("gain", gain >= sp.Float(spec.get("gainTarget", 0))),
-    ("ugbw", ugbw >= sp.Float(spec.get("ugbwTarget", 0))),
-    ("phase", phase >= sp.Float(spec.get("phaseTarget", 0))),
-    ("power", power <= sp.Float(spec.get("powerTarget", math.inf))),
-    ("noise", noise <= sp.Float(spec.get("noiseTarget", math.inf))),
-]
+checks = []
+if spec.get("gainTarget") is not None:
+    checks.append(("gain", gain >= sp.Float(spec["gainTarget"])))
+if spec.get("ugbwTarget") is not None:
+    checks.append(("ugbw", ugbw >= sp.Float(spec["ugbwTarget"])))
+if spec.get("phaseTarget") is not None:
+    checks.append(("phase", phase >= sp.Float(spec["phaseTarget"])))
+if spec.get("powerTarget") is not None:
+    checks.append(("power", power <= sp.Float(spec["powerTarget"])))
+if spec.get("noiseTarget") is not None:
+    checks.append(("noise", noise <= sp.Float(spec["noiseTarget"])))
 
 # These identities are retained as exact SymPy expressions and are exposed to
 # the caller as provenance for numerical threshold decisions.
