@@ -3,7 +3,9 @@ import { createReadStream, existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runPuctSearch } from './engine/mcts.mjs';
 import { runParEgo } from './engine/parego.mjs';
@@ -306,7 +308,21 @@ function extractDataSheetRequirements(text, fileName) {
       dataSheetRequirement('temperature_max', 'operating_temperature', '<=', 125, '°C', 'manual', 'TLV271 datasheet: industrial temperature maximum', true)
     ];
   }
-  const numericClauses = text.match(/[^\n]{0,60}\d+(?:\.\d+)?\s*(?:MHz|kHz|GHz|mV|V|mA|µA|uA|nV\s*\/\s*√?Hz|dB|°C)[^\n]{0,60}/gi) || [];
+  if (/tpa311[68]d2/i.test(text) || /tpa3116/i.test(normalized)) {
+    return [
+      dataSheetRequirement('supply_min', 'supply', '>=', 4.5, 'V', 'op', 'TPA3116D2 datasheet: recommended supply minimum'),
+      dataSheetRequirement('supply_max', 'supply', '<=', 26, 'V', 'op', 'TPA3116D2 datasheet: recommended supply maximum'),
+      dataSheetRequirement('output_power_typ', 'output_power', '>=', 50, 'W', 'ac', 'TPA3116D2 datasheet: 50-W into 4-Ω BTL load', true),
+      dataSheetRequirement('switching_freq_typ', 'switching_frequency', '>=', 400, 'kHz', 'ac', 'TPA3116D2 datasheet: 400-kHz typical switching frequency', true),
+      dataSheetRequirement('thd_n_typ', 'thd_n', '<=', 0.1, '%', 'ac', 'TPA3116D2 datasheet: THD+N < 0.1% at 1 kHz', true),
+      dataSheetRequirement('snr_typ', 'snr', '>=', 102, 'dB', 'noise', 'TPA3116D2 datasheet: 102-dB typical SNR'),
+      dataSheetRequirement('quiescent_current_typ', 'quiescent_current', '<=', 40, 'mA', 'op', 'TPA3116D2 datasheet: typical quiescent current', true),
+      dataSheetRequirement('efficiency_typ', 'efficiency', '>=', 90, '%', 'op', 'TPA3116D2 datasheet: >90% power efficiency at 12V', true),
+      dataSheetRequirement('temperature_min', 'operating_temperature', '>=', -40, '°C', 'manual', 'TPA3116D2 datasheet: industrial/automotive temperature minimum', true),
+      dataSheetRequirement('temperature_max', 'operating_temperature', '<=', 125, '°C', 'manual', 'TPA3116D2 datasheet: maximum junction/operating temperature', true)
+    ];
+  }
+  const numericClauses = text.match(/[^\n]{0,60}\d+(?:\.\d+)?\s*(?:MHz|kHz|GHz|mV|V|mA|µA|uA|nV\s*\/\s*√?Hz|dB|°C|W|%)[^\n]{0,60}/gi) || [];
   return numericClauses.slice(0, 80).map((clause, index) => dataSheetRequirement(
     'unclassified_' + index,
     'unclassified datasheet clause',
@@ -343,21 +359,55 @@ async function parseDataSheet(input) {
     error.statusCode = 413;
     throw error;
   }
-  let text;
+  let text = '';
   if (extension === '.pdf') {
-    const directory = await mkdtemp(path.join(process.env.TMPDIR || '/tmp', 'fusion-datasheet-'));
-    const source = path.join(directory, 'source.pdf');
+    let pdftotextExtracted = false;
     try {
-      await writeFile(source, bytes);
-      text = await execFileText('pdftotext', ['-layout', source, '-']);
-    } catch (cause) {
-      const error = new Error('PDF text extraction failed: ' + cause.message);
-      error.statusCode = 422;
-      throw error;
-    } finally {
-      await rm(directory, { recursive: true, force: true });
+      const tempBase = process.env.TMPDIR || os.tmpdir() || '.';
+      const directory = await mkdtemp(path.join(tempBase, 'fusion-datasheet-'));
+      const source = path.join(directory, 'source.pdf');
+      try {
+        await writeFile(source, bytes);
+        text = await execFileText('pdftotext', ['-layout', source, '-']);
+        pdftotextExtracted = true;
+      } finally {
+        await rm(directory, { recursive: true, force: true }).catch(() => {});
+      }
+    } catch {
+      // pdftotext executable not present or failed
     }
-  } else text = bytes.toString('utf8');
+
+    if (!pdftotextExtracted || !text.trim()) {
+      // Decompress FlateDecode streams from PDF binary using zlib
+      const binaryString = bytes.toString('binary');
+      let decompressedText = '';
+      const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+      let streamMatch;
+      while ((streamMatch = streamRegex.exec(binaryString)) !== null) {
+        const rawStream = Buffer.from(streamMatch[1], 'binary');
+        let decomp = null;
+        try { decomp = zlib.inflateSync(rawStream); } catch {}
+        if (!decomp) {
+          try { decomp = zlib.inflateRawSync(rawStream); } catch {}
+        }
+        if (decomp) {
+          const streamStr = decomp.toString('utf8');
+          const tjMatches = streamStr.match(/\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*T[jJ]/g) || [];
+          for (const tj of tjMatches) {
+            decompressedText += tj.replace(/\)\s*T[jJ]$/, '').replace(/^\(/, '') + ' ';
+          }
+        }
+      }
+      if (decompressedText.trim().length > 50) {
+        text = decompressedText;
+      } else {
+        const rawTextTokens = binaryString.match(/[a-zA-Z0-9_.-]{2,}/g) || [];
+        text = rawTextTokens.join(' ');
+      }
+    }
+  } else {
+    text = bytes.toString('utf8');
+  }
   const requirement = extractDataSheetRequirements(text, fileName);
   return {
     fileName,
@@ -365,8 +415,19 @@ async function parseDataSheet(input) {
     sha256: createHash('sha256').update(bytes).digest('hex').slice(0, 16),
     extractedCharacters: text.length,
     requirements: requirement,
-    parser: /tlv271/i.test(text) ? 'TI TLV271 deterministic profile' : 'numeric clauses tracked fail-closed'
+    parser: /tlv271/i.test(text)
+      ? 'TI TLV271 deterministic profile'
+      : /tpa311[68]d2/i.test(text)
+        ? 'TI TPA3116D2 Class-D amplifier profile'
+        : 'numeric clauses tracked fail-closed'
   };
+}
+
+function optionalNumber(value, min, max) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.min(max, Math.max(min, parsed));
 }
 
 export function normalizeInput(input = {}) {
@@ -380,13 +441,13 @@ export function normalizeInput(input = {}) {
     circuit,
     process: compactText(input.process, DEFAULT_INPUT.process, 80),
     supply: numberInRange(input.supply, DEFAULT_INPUT.supply, 0.6, 5),
-    gainTarget: numberInRange(input.gainTarget, DEFAULT_INPUT.gainTarget, 20, 120),
-    ugbwTarget: numberInRange(input.ugbwTarget, DEFAULT_INPUT.ugbwTarget, 0.1, 10000),
-    phaseTarget: numberInRange(input.phaseTarget, DEFAULT_INPUT.phaseTarget, 20, 120),
-    powerTarget: numberInRange(input.powerTarget, DEFAULT_INPUT.powerTarget, 0.01, 1000),
-    noiseTarget: numberInRange(input.noiseTarget, DEFAULT_INPUT.noiseTarget, 1, 1000),
+    gainTarget: input.gainTarget === undefined ? DEFAULT_INPUT.gainTarget : optionalNumber(input.gainTarget, 20, 120),
+    ugbwTarget: input.ugbwTarget === undefined ? DEFAULT_INPUT.ugbwTarget : optionalNumber(input.ugbwTarget, 0.1, 10000),
+    phaseTarget: input.phaseTarget === undefined ? DEFAULT_INPUT.phaseTarget : optionalNumber(input.phaseTarget, 20, 120),
+    powerTarget: input.powerTarget === undefined ? DEFAULT_INPUT.powerTarget : optionalNumber(input.powerTarget, 0.01, 1000),
+    noiseTarget: input.noiseTarget === undefined ? DEFAULT_INPUT.noiseTarget : optionalNumber(input.noiseTarget, 1, 1000),
     searchBudget: Math.round(numberInRange(input.searchBudget, DEFAULT_INPUT.searchBudget, 8, 256)),
-    prompt: compactText(input.prompt, DEFAULT_INPUT.prompt, 600),
+    prompt: compactText(input.prompt, '', 600),
     naturalRequest: compactText(input.naturalRequest, '', 6000),
     dataSheet: input.dataSheet || null
   };
@@ -396,7 +457,9 @@ function mergeExtractedSpec(spec, extracted = {}) {
   const aliases = ['supply', 'gainTarget', 'ugbwTarget', 'phaseTarget', 'powerTarget', 'noiseTarget', 'searchBudget'];
   const merged = { ...spec };
   for (const field of aliases) {
-    if (Object.hasOwn(extracted, field)) merged[field] = numberInRange(extracted[field], spec[field], field === 'supply' ? 0.6 : 0.01, field === 'searchBudget' ? 256 : 10000);
+    if (Object.hasOwn(extracted, field) && extracted[field] !== null && extracted[field] !== undefined) {
+      merged[field] = numberInRange(extracted[field], spec[field] || 1, field === 'supply' ? 0.6 : 0.01, field === 'searchBudget' ? 256 : 10000);
+    }
   }
   if (typeof extracted.process === 'string') merged.process = compactText(extracted.process, spec.process, 80);
   return merged;
@@ -414,13 +477,13 @@ const LEDGER_METRICS = new Map([
 ]);
 
 function defaultSpecLedger(spec) {
-  return [
-    { id: 'gain', metric: 'gain', operator: '>=', value: spec.gainTarget, unit: 'dB', testType: 'ac' },
-    { id: 'ugbw', metric: 'ugbw', operator: '>=', value: spec.ugbwTarget, unit: 'MHz', testType: 'ac' },
-    { id: 'phase', metric: 'phase', operator: '>=', value: spec.phaseTarget, unit: 'deg', testType: 'ac' },
-    { id: 'power', metric: 'power', operator: '<=', value: spec.powerTarget, unit: 'mW', testType: 'op' },
-    { id: 'noise', metric: 'noise', operator: '<=', value: spec.noiseTarget, unit: 'nV/√Hz', testType: 'noise' }
-  ];
+  const ledger = [];
+  if (spec.gainTarget !== null && spec.gainTarget !== undefined) ledger.push({ id: 'gain', metric: 'gain', operator: '>=', value: spec.gainTarget, unit: 'dB', testType: 'ac' });
+  if (spec.ugbwTarget !== null && spec.ugbwTarget !== undefined) ledger.push({ id: 'ugbw', metric: 'ugbw', operator: '>=', value: spec.ugbwTarget, unit: 'MHz', testType: 'ac' });
+  if (spec.phaseTarget !== null && spec.phaseTarget !== undefined) ledger.push({ id: 'phase', metric: 'phase', operator: '>=', value: spec.phaseTarget, unit: 'deg', testType: 'ac' });
+  if (spec.powerTarget !== null && spec.powerTarget !== undefined) ledger.push({ id: 'power', metric: 'power', operator: '<=', value: spec.powerTarget, unit: 'mW', testType: 'op' });
+  if (spec.noiseTarget !== null && spec.noiseTarget !== undefined) ledger.push({ id: 'noise', metric: 'noise', operator: '<=', value: spec.noiseTarget, unit: 'nV/√Hz', testType: 'noise' });
+  return ledger;
 }
 
 function buildSpecLedger(spec, llmLedger, naturalRequest) {
@@ -651,75 +714,97 @@ function estimateMetrics(template, spec, seed, selectedCandidate, action = defau
   const deviceDelta = deviceScale - 1;
   const compensationDelta = compensationScale - 1;
 
+  const targetGain = spec.gainTarget ?? DEFAULT_INPUT.gainTarget;
+  const targetUgbw = spec.ugbwTarget ?? DEFAULT_INPUT.ugbwTarget;
+  const targetPhase = spec.phaseTarget ?? DEFAULT_INPUT.phaseTarget;
+  const targetPower = spec.powerTarget ?? DEFAULT_INPUT.powerTarget;
+  const targetNoise = spec.noiseTarget ?? DEFAULT_INPUT.noiseTarget;
+
   if (template.id === 'sar_adc') {
     return {
       gain: round(6 + stableFraction(seed, 'gain') * 2 + deviceDelta * 3, 1),
-      ugbw: round(spec.ugbwTarget * quality * (1 + deviceDelta * 0.15 - compensationDelta * 0.07), 2),
+      ugbw: round(targetUgbw * quality * (1 + deviceDelta * 0.15 - compensationDelta * 0.07), 2),
       phase: round(67 + stableFraction(seed, 'phase') * 8 + compensationDelta * 26, 1),
-      power: round(spec.powerTarget * (0.83 + stableFraction(seed, 'power') * 0.08) * (1 + deviceDelta * 0.42), 3),
-      noise: round(spec.noiseTarget * (0.81 + stableFraction(seed, 'noise') * 0.08) * (1 - deviceDelta * 0.16), 2),
+      power: round(targetPower * (0.83 + stableFraction(seed, 'power') * 0.08) * (1 + deviceDelta * 0.42), 3),
+      noise: round(targetNoise * (0.81 + stableFraction(seed, 'noise') * 0.08) * (1 - deviceDelta * 0.16), 2),
       snr: round(48.7 + stableFraction(seed, 'snr') * 1.4 + deviceDelta * 1.4, 2),
       enob: round(7.8 + stableFraction(seed, 'enob') * 0.23 + deviceDelta * 0.2, 2)
     };
   }
 
   return {
-    gain: round(spec.gainTarget * quality + 0.45 + deviceDelta * 16, 1),
-    ugbw: round(spec.ugbwTarget * (0.99 + stableFraction(seed, 'ugbw') * 0.07) * (1 + deviceDelta * 0.18 - compensationDelta * 0.08), 2),
-    phase: round(spec.phaseTarget + 2.5 + stableFraction(seed, 'phase') * 7 + compensationDelta * 34, 1),
-    power: round(spec.powerTarget * (0.83 + stableFraction(seed, 'power') * 0.1) * (1 + deviceDelta * 0.42), 3),
-    noise: round(spec.noiseTarget * (0.76 + stableFraction(seed, 'noise') * 0.12) * (1 - deviceDelta * 0.16), 2),
+    gain: round(targetGain * quality + 0.45 + deviceDelta * 16, 1),
+    ugbw: round(targetUgbw * (0.99 + stableFraction(seed, 'ugbw') * 0.07) * (1 + deviceDelta * 0.18 - compensationDelta * 0.08), 2),
+    phase: round(targetPhase + 2.5 + stableFraction(seed, 'phase') * 7 + compensationDelta * 34, 1),
+    power: round(targetPower * (0.83 + stableFraction(seed, 'power') * 0.1) * (1 + deviceDelta * 0.42), 3),
+    noise: round(targetNoise * (0.76 + stableFraction(seed, 'noise') * 0.12) * (1 - deviceDelta * 0.16), 2),
     psrr: round(62 + stableFraction(seed, 'psrr') * 18, 1),
     settling: round(0.25 + stableFraction(seed, 'settling') * 0.34, 2)
   };
 }
 
 function makeConstraints(template, spec, metrics) {
-  const items = [
-    {
+  const items = [];
+
+  if (spec.ugbwTarget !== null && spec.ugbwTarget !== undefined) {
+    items.push({
       id: 'ugbw',
       label: template.id === 'sar_adc' ? '결정 속도' : 'Unity-gain bandwidth',
       target: '≥ ' + spec.ugbwTarget + ' MHz',
       actual: metrics.ugbw + ' MHz',
       passed: metrics.ugbw >= spec.ugbwTarget,
       oracle: 'f_u = g_m / (2πC_c)'
-    },
-    {
+    });
+  }
+
+  if (spec.phaseTarget !== null && spec.phaseTarget !== undefined) {
+    items.push({
       id: 'phase',
       label: 'Phase margin',
       target: '≥ ' + spec.phaseTarget + '°',
       actual: metrics.phase + '°',
       passed: metrics.phase >= spec.phaseTarget,
       oracle: 'PM = 180° + ∠A(jω_u)'
-    },
-    {
+    });
+  }
+
+  if (spec.powerTarget !== null && spec.powerTarget !== undefined) {
+    items.push({
       id: 'power',
       label: 'Power',
       target: '≤ ' + spec.powerTarget + ' mW',
       actual: metrics.power + ' mW',
       passed: metrics.power <= spec.powerTarget,
       oracle: 'P = V_DD × I_DD'
-    },
-    {
+    });
+  }
+
+  if (spec.noiseTarget !== null && spec.noiseTarget !== undefined) {
+    items.push({
       id: 'noise',
       label: 'Input-referred noise',
       target: '≤ ' + spec.noiseTarget + ' nV/√Hz',
       actual: metrics.noise + ' nV/√Hz',
       passed: metrics.noise <= spec.noiseTarget,
       oracle: 'v_n,total = √Σv_n,i²'
-    }
-  ];
+    });
+  }
 
   if (template.id !== 'sar_adc') {
-    items.unshift({
-      id: 'gain',
-      label: 'DC gain',
-      target: '≥ ' + spec.gainTarget + ' dB',
-      actual: metrics.gain + ' dB',
-      passed: metrics.gain >= spec.gainTarget,
-      oracle: 'A_0 ≈ g_m r_o'
-    });
-    const resourceStress = spec.gainTarget * spec.ugbwTarget / spec.powerTarget;
+    if (spec.gainTarget !== null && spec.gainTarget !== undefined) {
+      items.unshift({
+        id: 'gain',
+        label: 'DC gain',
+        target: '≥ ' + spec.gainTarget + ' dB',
+        actual: metrics.gain + ' dB',
+        passed: metrics.gain >= spec.gainTarget,
+        oracle: 'A_0 ≈ g_m r_o'
+      });
+    }
+    const gainT = spec.gainTarget || 60;
+    const ugbwT = spec.ugbwTarget || 20;
+    const powerT = spec.powerTarget || 1;
+    const resourceStress = gainT * ugbwT / powerT;
     if (resourceStress > 5000) {
       items.push({
         id: 'feasibility_guard',
@@ -731,7 +816,9 @@ function makeConstraints(template, spec, metrics) {
       });
     }
   } else {
-    const resourceStress = spec.ugbwTarget / spec.powerTarget;
+    const ugbwT = spec.ugbwTarget || 20;
+    const powerT = spec.powerTarget || 1;
+    const resourceStress = ugbwT / powerT;
     if (resourceStress > 100000) {
       items.push({
         id: 'feasibility_guard',
@@ -847,11 +934,22 @@ function runAgenticSizingCycle(template, spec, seed, selectedCandidate, plannerA
       };
       const metrics = estimateMetrics(template, spec, seed, selectedCandidate, candidateAction);
       const constraints = applySpecCoverage(makeConstraints(template, spec, metrics), specLedger, metrics, spec);
-      const gainLoss = Math.max(0, spec.gainTarget - metrics.gain) / Math.max(1, spec.gainTarget);
-      const speedLoss = Math.max(0, spec.ugbwTarget - metrics.ugbw) / Math.max(1, spec.ugbwTarget);
-      const phaseLoss = Math.max(0, spec.phaseTarget - metrics.phase) / Math.max(1, spec.phaseTarget);
-      const resourceLoss = Math.max(0, metrics.power - spec.powerTarget) / Math.max(0.01, spec.powerTarget)
-        + Math.max(0, metrics.noise - spec.noiseTarget) / Math.max(1, spec.noiseTarget);
+      const gainLoss = (spec.gainTarget !== null && spec.gainTarget !== undefined)
+        ? Math.max(0, spec.gainTarget - metrics.gain) / Math.max(1, spec.gainTarget)
+        : 0;
+      const speedLoss = (spec.ugbwTarget !== null && spec.ugbwTarget !== undefined)
+        ? Math.max(0, spec.ugbwTarget - metrics.ugbw) / Math.max(1, spec.ugbwTarget)
+        : 0;
+      const phaseLoss = (spec.phaseTarget !== null && spec.phaseTarget !== undefined)
+        ? Math.max(0, spec.phaseTarget - metrics.phase) / Math.max(1, spec.phaseTarget)
+        : 0;
+      const powerLoss = (spec.powerTarget !== null && spec.powerTarget !== undefined)
+        ? Math.max(0, metrics.power - spec.powerTarget) / Math.max(0.01, spec.powerTarget)
+        : 0;
+      const noiseLoss = (spec.noiseTarget !== null && spec.noiseTarget !== undefined)
+        ? Math.max(0, metrics.noise - spec.noiseTarget) / Math.max(1, spec.noiseTarget)
+        : 0;
+      const resourceLoss = powerLoss + noiseLoss;
       return {
         objectives: [gainLoss, speedLoss, phaseLoss, resourceLoss + violationScore(constraints) * 0.01],
         payload: { action: candidateAction, metrics, constraints }
@@ -1488,10 +1586,29 @@ async function serveStatic(response, requestPath) {
   createReadStream(target).pipe(response);
 }
 
+const SESSIONS_STORE = new Map();
+
+function defaultSessionList() {
+  if (SESSIONS_STORE.size === 0) {
+    const defaultId = 'sess-initial';
+    SESSIONS_STORE.set(defaultId, {
+      id: defaultId,
+      title: '새 설계 세션 (대기 중)',
+      meta: '사양 입력 후 실행하세요',
+      createdAt: new Date().toISOString(),
+      circuit: 'auto',
+      dataSheetName: null,
+      result: null
+    });
+  }
+  return [...SESSIONS_STORE.values()].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
 export function createApp() {
   return http.createServer(async (request, response) => {
+    let url = null;
     try {
-      const url = new URL(request.url || '/', 'http://localhost');
+      url = new URL(request.url || '/', 'http://localhost');
       if (request.method === 'GET' && url.pathname === '/api/health') {
         sendJson(response, 200, { ok: true, service: 'fusion-analog-agent-studio' });
         return;
@@ -1506,9 +1623,45 @@ export function createApp() {
         });
         return;
       }
+      if (request.method === 'GET' && url.pathname === '/api/sessions') {
+        sendJson(response, 200, { sessions: defaultSessionList() });
+        return;
+      }
+      if (request.method === 'POST' && url.pathname === '/api/sessions') {
+        const body = await readJsonBody(request);
+        const id = body.id || randomUUID();
+        const session = {
+          id,
+          title: compactText(body.title, '새 설계 세션', 100),
+          meta: compactText(body.meta, 'custom sandbox', 80),
+          createdAt: new Date().toISOString(),
+          circuit: body.circuit || 'two_stage_ota',
+          dataSheetName: body.dataSheetName || null,
+          payload: body.payload || null,
+          result: body.result || null
+        };
+        SESSIONS_STORE.set(id, session);
+        sendJson(response, 201, session);
+        return;
+      }
+      if (request.method === 'DELETE' && url.pathname.startsWith('/api/sessions/')) {
+        const id = url.pathname.slice('/api/sessions/'.length);
+        const deleted = SESSIONS_STORE.delete(id);
+        sendJson(response, 200, { ok: deleted, id });
+        return;
+      }
       if (request.method === 'POST' && url.pathname === '/api/agent/run') {
         const body = await readJsonBody(request);
         const result = await runDesignCycle(body);
+        if (body.sessionId) {
+          const current = SESSIONS_STORE.get(body.sessionId);
+          if (current) {
+            current.result = result;
+            current.circuit = result.topology.id;
+            current.title = result.topology.label + ' · ' + (result.spec.prompt ? result.spec.prompt.slice(0, 24) : 'Design');
+            current.meta = (result.spec.dataSheet ? result.spec.dataSheet.fileName : result.spec.process) + ' (' + (result.verification.exportAllowed ? 'VERIFIED' : 'ATTN') + ')';
+          }
+        }
         sendJson(response, 200, result);
         return;
       }
@@ -1523,9 +1676,11 @@ export function createApp() {
       }
       sendJson(response, 405, { error: 'Method not allowed' });
     } catch (error) {
+      console.error('Server error on', request.method, url?.pathname || request.url, error);
       const status = error && Number.isInteger(error.statusCode) ? error.statusCode : 500;
       sendJson(response, status, {
-        error: status === 500 ? 'Internal server error' : error.message
+        error: error.message || 'Internal server error',
+        stack: error.stack
       });
     }
   });
