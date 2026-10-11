@@ -316,6 +316,99 @@ function dataSheetRequirement(id, metric, operator, value, unit, testType, sourc
   return { id, metric, operator, value, unit, testType, source, unmapped };
 }
 
+// This is the technology-independent measurement vocabulary.  A part profile
+// may supply values and conditions, but it never supplies the verification
+// mechanism.  The same adapter plan is used for every supplier and every
+// document that names one of these electrical quantities.
+const MEASUREMENT_ADAPTERS = [
+  { metric: 'supply', aliases: ['supply', 'supply voltage', 'vdd', 'operating voltage'], testType: 'op', plan: 'DC supply sweep and operating-point legality' },
+  { metric: 'gain', aliases: ['gain', 'open loop gain', 'dc gain', 'voltage gain'], testType: 'ac', plan: 'low-frequency differential AC gain' },
+  { metric: 'ugbw', aliases: ['ugbw', 'gain bandwidth', 'gain-bandwidth', 'bandwidth', 'unity gain'], testType: 'ac', plan: 'AC sweep, unity-gain crossing interpolation' },
+  { metric: 'phase', aliases: ['phase margin', 'phase'], testType: 'ac', plan: 'loop AC sweep at unity crossing' },
+  { metric: 'noise', aliases: ['noise', 'input noise', 'input-referred noise', 'input referred noise'], testType: 'noise', plan: 'input-referred noise spectral density' },
+  { metric: 'power', aliases: ['power consumption', 'power dissipation', 'power'], testType: 'op', plan: 'supply voltage multiplied by supply current' },
+  { metric: 'supply_current', aliases: ['supply current', 'quiescent current', 'iq'], testType: 'op', plan: 'supply branch current at each operating point' },
+  { metric: 'slew_rate', aliases: ['slew rate'], testType: 'transient', plan: 'large-signal step response derivative' },
+  { metric: 'settling', aliases: ['settling time', 'settling'], testType: 'transient', plan: 'step response entry into specified error band' },
+  { metric: 'input_offset_voltage', aliases: ['input offset voltage', 'offset voltage', 'vos'], testType: 'op', plan: 'input servo sweep for zero-output crossing' },
+  { metric: 'input_bias_current', aliases: ['input bias current', 'bias current'], testType: 'op', plan: 'input pin DC branch-current measurement' },
+  { metric: 'cmrr', aliases: ['cmrr', 'common-mode rejection'], testType: 'ac', plan: 'common-mode versus differential AC gain ratio' },
+  { metric: 'psrr', aliases: ['psrr', 'power-supply rejection', 'power supply rejection'], testType: 'ac', plan: 'inject supply ripple and measure output transfer' },
+  { metric: 'output_current', aliases: ['output current', 'short circuit current'], testType: 'dc_sweep', plan: 'load-current sweep with output regulation limits' },
+  { metric: 'output_swing', aliases: ['output voltage swing', 'output swing'], testType: 'dc_sweep', plan: 'output-load sweep with clipping criterion' },
+  { metric: 'output_power', aliases: ['output power'], testType: 'transient', plan: 'periodic load transient, RMS voltage/current calculation' },
+  { metric: 'switching_frequency', aliases: ['switching frequency', 'switch frequency'], testType: 'transient', plan: 'switching-node period measurement' },
+  { metric: 'thd_n', aliases: ['thd+n', 'thd', 'total harmonic distortion'], testType: 'fft', plan: 'steady-state transient FFT and harmonic/noise ratio' },
+  { metric: 'snr', aliases: ['snr', 'signal-to-noise ratio', 'signal to noise ratio'], testType: 'fft', plan: 'steady-state transient FFT signal/noise integration' },
+  { metric: 'efficiency', aliases: ['efficiency'], testType: 'transient', plan: 'average load power divided by average supply power' },
+  { metric: 'operating_temperature', aliases: ['operating temperature', 'junction temperature', 'temperature range'], testType: 'temperature_sweep', plan: 'temperature-corner sweep using PDK temperature model' }
+];
+
+function measurementAdapterFor(metricOrText) {
+  const normalized = String(metricOrText || '').toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
+  const exact = MEASUREMENT_ADAPTERS.find((adapter) => adapter.metric === normalized);
+  if (exact) return exact;
+  // Prefer the most specific matching phrase: "output power" must not be
+  // reduced to the more general "power" adapter.
+  return MEASUREMENT_ADAPTERS
+    .flatMap((adapter) => adapter.aliases
+      .filter((alias) => normalized.includes(alias))
+      .map((alias) => ({ adapter, length: alias.length })))
+    .sort((left, right) => right.length - left.length)[0]?.adapter;
+}
+
+function adaptDataSheetRequirement(requirement) {
+  const adapter = measurementAdapterFor(requirement.metric) || measurementAdapterFor(requirement.source);
+  if (!adapter) return { ...requirement, unmapped: true, adapter: null };
+  return {
+    ...requirement,
+    metric: adapter.metric,
+    testType: adapter.testType,
+    unmapped: false,
+    adapter: { metric: adapter.metric, testType: adapter.testType, plan: adapter.plan, status: 'planned' }
+  };
+}
+
+function detectRequirementOperator(clause, metric) {
+  const lower = clause.toLowerCase();
+  if (/\b(?:max(?:imum)?|less than|no more than|≤|<)\b/.test(lower)) return '<=';
+  if (/\b(?:min(?:imum)?|greater than|at least|≥|>)\b/.test(lower)) return '>=';
+  // Quantities conventionally specified as ceilings remain ceilings when the
+  // table loses its Max column during PDF extraction.
+  return ['noise', 'power', 'supply_current', 'input_offset_voltage', 'input_bias_current', 'thd_n', 'settling'].includes(metric) ? '<=' : '>=';
+}
+
+function extractGenericDataSheetRequirements(text, fileName) {
+  const lines = text.split(/\r?\n/).map((line) => compactText(line, '', 360)).filter(Boolean);
+  const requirements = [];
+  const reviewCandidates = [];
+  const seen = new Set();
+  const numeric = /(-?\d+(?:\.\d+)?)\s*-?\s*(MHz|kHz|GHz|nV\s*\/\s*√?Hz|V\s*\/\s*[µu]s|mV|mA|µA|uA|pA|mW|W|V|dB|°C|%|ns|us|µs)/i;
+  for (const line of lines) {
+    const match = line.match(numeric);
+    if (!match) continue;
+    const adapter = measurementAdapterFor(line);
+    const source = compactText(line, fileName, 240);
+    if (!adapter) {
+      if (reviewCandidates.length < 12 && !reviewCandidates.includes(source)) reviewCandidates.push(source);
+      continue;
+    }
+    const key = adapter.metric + '|' + match[1] + '|' + match[2].toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    requirements.push(adaptDataSheetRequirement(dataSheetRequirement(
+      'parsed_' + requirements.length,
+      adapter.metric,
+      detectRequirementOperator(line, adapter.metric),
+      Number(match[1]),
+      match[2].replace(/\s+/g, ''),
+      adapter.testType,
+      source
+    )));
+  }
+  return { requirements, reviewCandidates };
+}
+
 function extractDataSheetRequirements(text, fileName) {
   const normalized = text.replace(/\s+/g, ' ').toLowerCase();
   // A deterministic profile keeps original supplier requirements distinct from
@@ -352,17 +445,7 @@ function extractDataSheetRequirements(text, fileName) {
       dataSheetRequirement('temperature_max', 'operating_temperature', '<=', 125, '°C', 'manual', 'TPA3116D2 datasheet: maximum junction/operating temperature', true)
     ];
   }
-  const numericClauses = text.match(/[^\n]{0,60}\d+(?:\.\d+)?\s*(?:MHz|kHz|GHz|mV|V|mA|µA|uA|nV\s*\/\s*√?Hz|dB|°C|W|%)[^\n]{0,60}/gi) || [];
-  return numericClauses.slice(0, 80).map((clause, index) => dataSheetRequirement(
-    'unclassified_' + index,
-    'unclassified datasheet clause',
-    '>=',
-    0,
-    '',
-    'manual',
-    compactText(clause, fileName, 180),
-    true
-  ));
+  return extractGenericDataSheetRequirements(text, fileName);
 }
 
 function execFileText(command, args, options = {}) {
@@ -415,18 +498,21 @@ async function parseDataSheet(input) {
   } else {
     text = bytes.toString('utf8');
   }
-  const requirement = extractDataSheetRequirements(text, fileName);
+  const extracted = extractDataSheetRequirements(text, fileName);
+  const requirements = (Array.isArray(extracted) ? extracted : extracted.requirements).map(adaptDataSheetRequirement);
+  const reviewCandidates = Array.isArray(extracted) ? [] : extracted.reviewCandidates;
   return {
     fileName,
     mimeType: compactText(input.mimeType, extension === '.pdf' ? 'application/pdf' : 'text/plain', 80),
     sha256: createHash('sha256').update(bytes).digest('hex').slice(0, 16),
     extractedCharacters: text.length,
-    requirements: requirement,
+    requirements,
+    reviewCandidates,
     parser: /tlv271/i.test(text)
       ? 'TI TLV271 deterministic profile'
       : /tpa311[68]d2/i.test(text)
         ? 'TI TPA3116D2 Class-D amplifier profile'
-        : 'numeric clauses tracked fail-closed'
+        : 'universal measurement-plan extraction'
   };
 }
 
@@ -489,7 +575,10 @@ function dataSheetContract(spec, pdkProfile) {
   if (maximum !== null && spec.supply > maximum) blockers.push(`VDD ${spec.supply} V가 데이터시트 최대 ${maximum} V보다 높습니다.`);
 
   const unmapped = (spec.dataSheet?.requirements || []).filter((item) => item.unmapped);
-  if (unmapped.length) blockers.push(`데이터시트의 ${unmapped.length}개 사양에 결정론적 measurement adapter가 없습니다: ${unmapped.map((item) => item.metric).join(', ')}.`);
+  // An unknown PDF fragment is retained for review and blocks sign-off later,
+  // but it must not be mistaken for an invalid circuit specification that
+  // prevents the Architect from proposing a topology.
+  if (unmapped.length) blockers.push(`데이터시트의 ${unmapped.length}개 명시 사양을 측정 계획으로 변환하지 못했습니다: ${[...new Set(unmapped.map((item) => item.metric))].join(', ')}.`);
   const uniqueBlockers = [...new Set(blockers)];
 
   return {
@@ -499,6 +588,8 @@ function dataSheetContract(spec, pdkProfile) {
     lockedCircuitLabel: lockedCircuit ? TEMPLATE_LIBRARY[lockedCircuit].label : null,
     supplyRange: { minimum, maximum },
     unmappedMetrics: unmapped.map((item) => item.metric),
+    reviewRequired: Boolean(spec.dataSheet?.reviewCandidates?.length),
+    reviewCandidates: (spec.dataSheet?.reviewCandidates || []).slice(0, 5),
     pdk: { id: pdkProfile.id, label: pdkProfile.label }
   };
 }
@@ -536,6 +627,10 @@ const LEDGER_METRICS = new Map([
   ,['settling', 'settling'], ['settling_time', 'settling'], ['정착시간', 'settling']
   ,['supply_voltage', 'supply'], ['vdd', 'supply'], ['전원전압', 'supply']
 ]);
+for (const adapter of MEASUREMENT_ADAPTERS) {
+  LEDGER_METRICS.set(adapter.metric, adapter.metric);
+  for (const alias of adapter.aliases) LEDGER_METRICS.set(alias.replace(/[\s-]+/g, '_'), adapter.metric);
+}
 
 function defaultSpecLedger(spec) {
   const ledger = [];
@@ -589,7 +684,17 @@ function buildSpecLedger(spec, llmLedger, naturalRequest) {
     for (const [key, existing] of ledger) {
       if (existing.metric === item.metric && String(existing.source || '').startsWith('LLM extracted')) ledger.delete(key);
     }
-    ledger.set('datasheet_' + item.id, { ...item, id: 'datasheet_' + item.id, source: item.source + ' · uploaded ' + spec.dataSheet.fileName });
+    const adapted = adaptDataSheetRequirement(item);
+    ledger.set('datasheet_' + item.id, { ...adapted, id: 'datasheet_' + item.id, source: item.source + ' · uploaded ' + spec.dataSheet.fileName });
+  }
+  for (const candidate of spec.dataSheet?.reviewCandidates || []) {
+    ledger.set('review_' + ledger.size, {
+      id: 'review_' + ledger.size,
+      metric: 'document clause awaiting classification',
+      operator: '>=', value: 0, unit: '', testType: 'manual',
+      source: candidate + ' · uploaded ' + spec.dataSheet.fileName,
+      unmapped: true, reviewOnly: true
+    });
   }
   return [...ledger.values()];
 }
@@ -985,15 +1090,28 @@ function applySpecCoverage(constraints, ledger, metrics, spec) {
         source: item.source || 'structured spec'
       };
     }
+    if (item.adapter) {
+      return {
+        id: item.id,
+        ledgerId: item.id,
+        label: item.metric,
+        target: item.operator + ' ' + item.value + (item.unit ? ' ' + item.unit : ''),
+        actual: 'measurement plan generated; physical simulation pending',
+        passed: false,
+        coverage: 'planned',
+        oracle: item.adapter.plan,
+        source: item.source || 'structured spec'
+      };
+    }
     return {
       id: item.id,
       ledgerId: item.id,
       label: item.metric,
       target: item.operator + ' ' + item.value + (item.unit ? ' ' + item.unit : ''),
-      actual: 'no deterministic oracle / testbench mapping',
+      actual: item.reviewOnly ? 'PDF clause needs metric/condition classification' : 'no deterministic measurement mapping',
       passed: false,
-      coverage: 'unmapped',
-      oracle: 'missing verification mapping',
+      coverage: item.reviewOnly ? 'review' : 'unmapped',
+      oracle: item.reviewOnly ? 'document classification review' : 'missing verification mapping',
       source: item.source || 'structured spec'
     };
   });
@@ -1190,7 +1308,18 @@ function makeNetlist(template, spec, variables, pdkProfile) {
   return header.concat(body).concat(['.end']).join('\n');
 }
 
-function makeTestbench(template, spec, pdkProfile) {
+function buildMeasurementPlan(ledger = []) {
+  return ledger.map((item) => ({
+    ledgerId: item.id,
+    metric: item.metric,
+    target: item.operator + ' ' + item.value + (item.unit ? ' ' + item.unit : ''),
+    status: item.adapter ? 'testbench-planned' : item.reviewOnly ? 'classification-required' : 'adapter-required',
+    testType: item.adapter?.testType || item.testType || 'manual',
+    procedure: item.adapter?.plan || 'Classify the source requirement before constructing a deterministic test.'
+  }));
+}
+
+function makeTestbench(template, spec, pdkProfile, ledger = []) {
   const common = [
     '* Generated ngspice testbench for ' + pdkProfile.id + '; Spectre .scs syntax is not accepted.',
     '.op',
@@ -1204,6 +1333,25 @@ function makeTestbench(template, spec, pdkProfile) {
     common.splice(1, 0, 'VCLK clk 0 PULSE(0 ' + spec.supply + ' 1n 100p 100p 10n 20n)');
   } else {
     common.splice(1, 0, 'VINP vinp 0 AC 0.5', 'VINN vinn 0 AC -0.5');
+  }
+  const planned = new Set();
+  for (const item of ledger) {
+    const adapter = item.adapter;
+    if (!adapter || planned.has(adapter.metric)) continue;
+    planned.add(adapter.metric);
+    // These statements are emitted deterministically from the metric class;
+    // their stimulus/load conditions are completed by the circuit family
+    // adapter before a physical sign-off run.
+    common.push('* adapter ' + adapter.metric + ': ' + adapter.plan);
+    if (adapter.metric === 'gain') common.push('.meas ac gain_db FIND vdb(vout) AT=10');
+    if (adapter.metric === 'supply_current') common.push('.meas op supply_current PARAM = -i(VDD)');
+    if (adapter.metric === 'power') common.push('.meas op supply_power PARAM = -v(vdd)*i(VDD)');
+    if (adapter.metric === 'slew_rate') common.push('.meas tran slew_rise DERIV v(vout) FROM=2u TO=18u');
+    if (adapter.metric === 'settling') common.push('.meas tran settling_time WHEN abs(v(vout)-v(in))=0.01');
+    if (adapter.metric === 'output_current') common.push('.dc RLOAD 1k 100k 10k');
+    if (adapter.metric === 'noise') common.push('.noise v(vout) VINP dec 30 10 10G');
+    if (adapter.metric === 'thd_n' || adapter.metric === 'snr') common.push('* FFT adapter requires a periodic transient stimulus and post-processed harmonic bins.');
+    if (adapter.metric === 'operating_temperature') common.push('* temperature adapter expands this deck per PDK-supported .temp corner.');
   }
   return common.join('\n');
 }
@@ -1609,7 +1757,8 @@ export async function runDesignCycle(rawInput = {}) {
     : { name: 'Verifier', output: { llmVerdict: 'pass', riskSummary: 'test-only deterministic bypass', testIntent: [] } };
   const exportsAllowed = sizing.verified && platformEligibility.compatible && symbolicOracle.available && symbolicOracle.allPassed;
   const exportedNetlist = exportsAllowed ? makeNetlist(template, effectiveSpec, sizing.variables, pdkProfile) : null;
-  const exportedTestbench = exportsAllowed ? makeTestbench(template, effectiveSpec, pdkProfile) : null;
+  const measurementPlan = buildMeasurementPlan(specificationLedger);
+  const exportedTestbench = exportsAllowed ? makeTestbench(template, effectiveSpec, pdkProfile, specificationLedger) : null;
   const ngspice = await detectNgspice();
   const pdk = await detectPdk();
   let simulation = ngspice.available && pdk.available
@@ -1667,10 +1816,12 @@ export async function runDesignCycle(rawInput = {}) {
     metrics: sizing.metrics,
     constraints: sizing.constraints,
     specificationLedger,
+    measurementPlan,
     specCoverage: {
       total: specificationLedger.length,
       mapped: specificationLedger.filter((item) => !item.unmapped).length,
       unmapped: specificationLedger.filter((item) => item.unmapped).length,
+      planned: specificationLedger.filter((item) => item.adapter).length,
       complete: specificationLedger.every((item) => !item.unmapped)
     },
     platformEligibility,
@@ -1821,7 +1972,8 @@ export function createApp() {
           dataSheet: {
             fileName: dataSheet.fileName,
             parser: dataSheet.parser,
-            requirements: dataSheet.requirements
+            requirements: dataSheet.requirements,
+            reviewCandidates: dataSheet.reviewCandidates
           },
           contract: dataSheetContract(spec, pdkProfile)
         });

@@ -556,8 +556,11 @@ function renderAll(result) {
   if (result.dataSheet) {
     const status = target('#datasheet-status');
     if (status) {
+      const review = result.dataSheet.reviewCandidates?.length
+        ? ' · ' + result.dataSheet.reviewCandidates.length + '개 문맥 검토 대기'
+        : '';
       status.textContent = result.dataSheet.fileName + ' · ' + result.dataSheet.requirements.length
-        + '개 사양 추출 · ' + result.dataSheet.parser + ' · hash ' + result.dataSheet.sha256;
+        + '개 사양 추출' + review + ' · ' + result.dataSheet.parser + ' · hash ' + result.dataSheet.sha256;
       status.className = 'ready';
     }
   }
@@ -854,8 +857,11 @@ target('#datasheet-input').addEventListener('change', async (event) => {
       status.className = 'error';
     } else {
       const lock = inspected.contract.lockedCircuitLabel ? ' · 회로군: ' + inspected.contract.lockedCircuitLabel : '';
-      status.textContent = file.name + lock + ' · 데이터시트/PDK 계약을 확인했습니다.';
-      status.className = 'ready';
+      const review = inspected.contract.reviewRequired
+        ? ' · 숫자 문맥 ' + inspected.contract.reviewCandidates.length + '개는 검토 대기이며 설계 탐색은 가능, export 승인은 보류됩니다.'
+        : '';
+      status.textContent = file.name + lock + ' · 데이터시트/PDK 계약을 확인했습니다.' + review;
+      status.className = inspected.contract.reviewRequired ? '' : 'ready';
     }
   } catch (error) {
     state.dataSheet = null;
