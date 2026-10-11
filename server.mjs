@@ -141,6 +141,17 @@ const TEMPLATE_LIBRARY = {
       ['cmp', 'dout', 'SAR'], ['dac', 'gnd', 'CUNIT']
     ]
   }
+  ,class_d_audio_amp: {
+    id: 'class_d_audio_amp', label: 'BTL Class-D audio power amplifier', shortLabel: 'Class-D', family: '전력 오디오',
+    template: 'PWM modulator + gate driver + BTL power stage + LC output filter', netlistKind: 'class_d',
+    roles: [['modulator', 'PWM 변조기', 'PWM'], ['gate_driver', '게이트 드라이버', 'DRV'], ['power_stage', 'BTL 파워 스테이지', 'HS/LS'], ['output_filter', 'LC 출력 필터', 'L, C'], ['protection', '보호·피드백', 'OCP/FB']],
+    nodes: [
+      { id: 'in', label: 'AUDIO IN', x: 42, y: 202, kind: 'port' }, { id: 'pwm', label: 'PWM', x: 160, y: 202, kind: 'node' },
+      { id: 'drv', label: 'DRV', x: 286, y: 202, kind: 'node' }, { id: 'btl', label: 'BTL', x: 414, y: 202, kind: 'node' },
+      { id: 'out', label: 'SPK OUT', x: 588, y: 202, kind: 'port' }, { id: 'vdd', label: 'PVDD', x: 350, y: 50, kind: 'supply' }, { id: 'gnd', label: 'PGND', x: 350, y: 354, kind: 'ground' }
+    ],
+    edges: [['in', 'pwm', 'MOD'], ['pwm', 'drv', 'PWM-A/B'], ['drv', 'btl', 'GATE'], ['btl', 'out', 'LC'], ['vdd', 'btl', 'POWER'], ['btl', 'gnd', 'RETURN']]
+  }
 };
 
 function genericTemplate(id, label, family, roleNames, blockLabels) {
@@ -175,6 +186,22 @@ Object.assign(TEMPLATE_LIBRARY, {
   pll: genericTemplate('pll', 'Charge-pump PLL', '클록', [['pfd', 'PFD'], ['charge_pump', '차지 펌프'], ['loop_filter', '루프 필터'], ['vco', 'VCO']], ['PFD', 'CP', 'LF', 'VCO']),
   delta_sigma_adc: genericTemplate('delta_sigma_adc', 'Delta-sigma ADC modulator', '혼성신호', [['integrator', '적분기'], ['comparator', '비교기'], ['dac', '피드백 DAC'], ['logic', '디지털 로직']], ['INT', 'COMP', 'DAC', 'LOGIC'])
 });
+
+function inferredDataSheetCircuit(dataSheet) {
+  if (dataSheet?.parser === 'TI TPA3116D2 Class-D amplifier profile') return 'class_d_audio_amp';
+  return null;
+}
+
+function assessPlatformEligibility(template, spec) {
+  if (template.id !== 'class_d_audio_amp') return { compatible: true, reasons: [] };
+  const supplyMaximum = spec.dataSheet?.requirements?.find((item) => item.id === 'supply_max')?.value;
+  const outputPower = spec.dataSheet?.requirements?.find((item) => item.id === 'output_power_typ')?.value;
+  const reasons = [];
+  if (Number(supplyMaximum) > 5) reasons.push(`requested PVDD up to ${supplyMaximum} V exceeds the bundled SKY130 low-voltage device domain`);
+  if (Number(outputPower) > 1) reasons.push(`requested ${outputPower} W BTL output requires an external/high-voltage power-device PDK and load model`);
+  reasons.push('THD+N, efficiency, switching-frequency, and protection verification require a Class-D switching/load testbench adapter');
+  return { compatible: false, reasons, requiredAdapter: 'class-d-power-stage + LC/load + thermal/protection verification adapter' };
+}
 
 const SOURCE_CARDS = [
   {
@@ -594,13 +621,20 @@ function topologyGrammar(template, explorationBias) {
         { id: 'pass:nmos', label: 'NMOS pass device', prior: 0.21 - explorationBias },
         { id: 'fb:divider', label: 'resistive feedback', prior: 0.997 }
       ]
-      : [
+      : template.id === 'class_d_audio_amp'
+        ? [
+          { id: 'mod:pwm', label: 'PWM modulator', prior: 0.997 },
+          { id: 'driver:bootstrap', label: 'bootstrap gate driver', prior: 0.76 + explorationBias },
+          { id: 'driver:isolated', label: 'isolated gate driver', prior: 0.24 - explorationBias },
+          { id: 'output:btl_lc', label: 'BTL LC output filter', prior: 0.997 }
+        ]
+        : [
         { id: 'sample:bootstrapped', label: 'sampling switch', prior: 0.997 },
         { id: 'cmp:strongarm', label: 'StrongARM comparator', prior: 0.78 + explorationBias },
         { id: 'cmp:doubletail', label: 'double-tail comparator', prior: 0.22 - explorationBias },
         { id: 'dac:binary', label: 'binary CDAC', prior: 0.997 }
       ];
-  const stages = (template.id === 'ldo' || template.netlistKind === 'generic') ? [[choices[0]], [choices[1], choices[2]], [choices[3]]]
+  const stages = (template.id === 'ldo' || template.id === 'class_d_audio_amp' || template.netlistKind === 'generic') ? [[choices[0]], [choices[1], choices[2]], [choices[3]]]
     : [[choices[0]], [choices[1], choices[2]], [choices[3], choices[4]]];
   return stages.map((stage) => stage.map((entry) => ({ ...entry, prior: clamp(entry.prior, 0.001, 0.999) })));
 }
@@ -629,6 +663,8 @@ function buildCandidates(template, spec, seed, action = defaultSizingAction(temp
     ? ['input:diffpair', 'load:mirror', 'comp:miller']
     : template.id === 'ldo'
       ? ['ea:diffpair', 'pass:pmos', 'fb:divider']
+      : template.id === 'class_d_audio_amp'
+        ? ['mod:pwm', 'driver:bootstrap', 'output:btl_lc']
       : ['sample:bootstrapped', 'cmp:strongarm', 'dac:binary'];
   const labelFor = (tokens) => tokens.map((token) => token.split(':')[1]).join(' + ');
   const rewardFor = (state) => {
@@ -1367,14 +1403,15 @@ function graphContext(knowledge) {
 
 async function runOpenRouterArchitecture(spec, template, knowledge) {
   const catalog = Object.values(TEMPLATE_LIBRARY).map((entry) => ({ id: entry.id, label: entry.label, family: entry.family }));
+  const dataSheetLock = inferredDataSheetCircuit(spec.dataSheet);
   const result = await callOpenRouterAgent({
     name: 'Architect',
     system: 'You are the Architect in an analog-circuit agent team. Use only GraphRAG evidence supplied by the server. Produce a functional decomposition and bounded topology hypotheses, never a SPICE netlist. Novelty is a research candidate only; deterministic gates control production export.',
-    prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\nArchitecture policy: ${spec.architectureMode} (reliability=canonical only, balanced=dual track, discovery=more research search).\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "functionalPartitions":["signal-path|bias-and-reference|stability-and-control"], "topologyHypotheses":["bounded grammar hint"], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
+    prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\n${dataSheetLock ? `DATASHEET CLASSIFICATION LOCK: select ${dataSheetLock}; never substitute an OTA or unrelated circuit family.` : ''}\nArchitecture policy: ${spec.architectureMode} (reliability=canonical only, balanced=dual track, discovery=more research search).\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "functionalPartitions":["signal-path|bias-and-reference|stability-and-control"], "topologyHypotheses":["bounded grammar hint"], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
     schema: 'architecture-v1'
   });
-  const selected = TEMPLATE_LIBRARY[result.output.circuit] || template;
-  return { ...result, selectedTemplate: selected, output: { ...result.output, circuit: selected.id } };
+  const selected = TEMPLATE_LIBRARY[dataSheetLock] || TEMPLATE_LIBRARY[result.output.circuit] || template;
+  return { ...result, selectedTemplate: selected, output: { ...result.output, circuit: selected.id, dataSheetLock: dataSheetLock || null } };
 }
 
 async function runOpenRouterPlanner(spec, template, knowledge, architecture, hierarchy) {
@@ -1421,7 +1458,10 @@ async function runOpenRouterVerifier(spec, template, symbolicOracle, constraints
 export async function runDesignCycle(rawInput = {}) {
   const dataSheet = await parseDataSheet(rawInput.dataSheet);
   const spec = { ...normalizeInput(rawInput), dataSheet };
-  const requestedTemplate = TEMPLATE_LIBRARY[spec.circuit] || TEMPLATE_LIBRARY[DEFAULT_INPUT.circuit];
+  const lockedDataSheetCircuit = inferredDataSheetCircuit(dataSheet);
+  const requestedTemplate = TEMPLATE_LIBRARY[lockedDataSheetCircuit]
+    || TEMPLATE_LIBRARY[spec.circuit]
+    || TEMPLATE_LIBRARY[DEFAULT_INPUT.circuit];
   const planningIdentity = openRouterConfigured() ? 'openrouter:' + process.env.OPENROUTER_MODEL : 'llm-unconfigured';
   const cacheKey = createHash('sha256')
     .update(JSON.stringify({ spec, planningIdentity, engine: 'graphrag-agent-loop-v3-datasheet' }))
@@ -1446,7 +1486,7 @@ export async function runDesignCycle(rawInput = {}) {
   }
   const architecture = llmRequired()
     ? await runOpenRouterArchitecture(spec, requestedTemplate, initialKnowledge)
-    : { name: 'Architect', output: { circuit: requestedTemplate.id, rationale: 'test-only deterministic bypass' }, selectedTemplate: requestedTemplate };
+    : { name: 'Architect', output: { circuit: requestedTemplate.id, rationale: 'test-only deterministic bypass', dataSheetLock: lockedDataSheetCircuit }, selectedTemplate: requestedTemplate };
   const template = architecture.selectedTemplate;
   const effectiveSpec = { ...mergeExtractedSpec(spec, architecture.output.extractedSpec), circuit: template.id };
   const specificationLedger = buildSpecLedger(effectiveSpec, architecture.output.specificationLedger, spec.naturalRequest);
@@ -1462,6 +1502,16 @@ export async function runDesignCycle(rawInput = {}) {
   const candidates = topologySearch.candidates;
   const selected = candidates.find((candidate) => candidate.status === 'selected') || candidates[0];
   let sizing = runAgenticSizingCycle(template, effectiveSpec, cacheKey, selected, planner.action, specificationLedger);
+  const platformEligibility = assessPlatformEligibility(template, effectiveSpec);
+  if (!platformEligibility.compatible) {
+    sizing.constraints.push({
+      id: 'platform_compatibility', label: 'PDK / verification-adapter compatibility',
+      target: 'matching voltage/power PDK and Class-D verification adapter',
+      actual: platformEligibility.reasons.join('; '), passed: false,
+      oracle: 'technology-domain gate', coverage: 'unmapped'
+    });
+    sizing.verified = false;
+  }
   const critic = llmRequired()
     ? await runOpenRouterCritic(effectiveSpec, template, knowledge, sizing, planner)
     : { name: 'Critic', output: { verdict: 'pass', reason: 'test-only deterministic bypass' } };
@@ -1475,12 +1525,21 @@ export async function runDesignCycle(rawInput = {}) {
     const revised = runAgenticSizingCycle(template, effectiveSpec, cacheKey + ':critic', selected, revisedAction, specificationLedger);
     if (violationScore(revised.constraints) <= violationScore(sizing.constraints)) sizing = revised;
   }
+  if (!platformEligibility.compatible && !sizing.constraints.some((item) => item.id === 'platform_compatibility')) {
+    sizing.constraints.push({
+      id: 'platform_compatibility', label: 'PDK / verification-adapter compatibility',
+      target: 'matching voltage/power PDK and Class-D verification adapter',
+      actual: platformEligibility.reasons.join('; '), passed: false,
+      oracle: 'technology-domain gate', coverage: 'unmapped'
+    });
+    sizing.verified = false;
+  }
   const symbolicOracle = await evaluateSymbolicOracle({ metrics: sizing.metrics, spec: effectiveSpec });
   const pdg = makePdg(template, specificationLedger);
   const verifier = llmRequired()
     ? await runOpenRouterVerifier(effectiveSpec, template, symbolicOracle, sizing.constraints, pdg)
     : { name: 'Verifier', output: { llmVerdict: 'pass', riskSummary: 'test-only deterministic bypass', testIntent: [] } };
-  const exportsAllowed = sizing.verified && symbolicOracle.available && symbolicOracle.allPassed;
+  const exportsAllowed = sizing.verified && platformEligibility.compatible && symbolicOracle.available && symbolicOracle.allPassed;
   const exportedNetlist = exportsAllowed ? makeNetlist(template, effectiveSpec, sizing.variables) : null;
   const exportedTestbench = exportsAllowed ? makeTestbench(template, effectiveSpec) : null;
   const ngspice = await detectNgspice();
@@ -1532,6 +1591,7 @@ export async function runDesignCycle(rawInput = {}) {
       unmapped: specificationLedger.filter((item) => item.unmapped).length,
       complete: specificationLedger.every((item) => !item.unmapped)
     },
+    platformEligibility,
     iterationHistory: sizing.iterationHistory,
     optimization: sizing.optimization,
     roleKnowledge: sizing.roleKnowledge,

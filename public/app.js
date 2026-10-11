@@ -310,6 +310,12 @@ function variableArtifact(result) {
 function artifactText() {
   if (!state.result) return '실행 후 템플릿 제약 넷리스트가 이곳에 표시됩니다.';
   if (!state.result.verification.exportAllowed) {
+    const eligibility = state.result.platformEligibility;
+    if (eligibility && !eligibility.compatible) {
+      return 'EXPORT BLOCKED — TARGET / PDK MISMATCH\n\n이 데이터시트는 현재 PDK와 검증 어댑터 범위를 벗어납니다.\n\n'
+        + eligibility.reasons.map((reason) => '• ' + reason).join('\n') + '\n\n'
+        + '선택된 토폴로지는 데이터시트 분류에 따른 검토용 Class-D 후보입니다. 적합한 고전압/파워 PDK와 Class-D load·THD·효율 검증 어댑터를 연결한 후에만 export할 수 있습니다.';
+    }
     const failed = state.result.constraints
       .filter((constraint) => !constraint.passed)
       .map((constraint) => constraint.label)
@@ -567,7 +573,7 @@ async function runDesign(event) {
       isCached ? '캐시에서 설계 기록 복원' : (verified ? '설계 앵커 준비 완료' : '검증 미통과 · export 차단'),
       isCached
         ? '동일 사양의 최적화 기록을 재사용했습니다.'
-        : (verified ? '템플릿·PDG·수치 제약을 통과했습니다.' : '미충족 제약을 조정한 뒤 다시 실행해 주세요.'),
+      : (verified ? '템플릿·PDG·수치 제약을 통과했습니다.' : (results[0].platformEligibility?.compatible === false ? '데이터시트 목표와 현재 PDK/검증 어댑터가 호환되지 않습니다.' : '미충족 제약을 조정한 뒤 다시 실행해 주세요.')),
       false
     );
     showToast(isCached
