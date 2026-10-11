@@ -357,6 +357,29 @@ function measurementAdapterFor(metricOrText) {
     .sort((left, right) => right.length - left.length)[0]?.adapter;
 }
 
+function extractTestConditions(source) {
+  const text = String(source || '');
+  const conditions = [];
+  const add = (id, label, pattern, unitOverride) => {
+    const match = text.match(pattern);
+    if (!match) return;
+    const value = Number(match[1]);
+    if (!Number.isFinite(value) || conditions.some((item) => item.id === id && item.value === value)) return;
+    conditions.push({ id, label, value, unit: unitOverride || match[2] || '', source: match[0].trim() });
+  };
+  add('supply', 'supply voltage', /(?:\bV(?:DD|CC|SS)\b|supply(?:\s+voltage)?)\s*(?:=|at|of)?\s*(-?\d+(?:\.\d+)?)\s*(m?V)\b/i);
+  add('temperature', 'temperature', /(?:\bT(?:A|J)?\b|temperature)\s*(?:=|at|of)?\s*(-?\d+(?:\.\d+)?)\s*(°C|C)\b/i, '°C');
+  const load = text.match(/(?:\bR[ _-]?L\b|load(?:\s+resistance)?|into)\s*(?:=|at|of)?\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*-?\s*(?:Ω|ohm)/i);
+  if (load) {
+    const multiplier = load[2].toLowerCase() === 'k' ? 1e3 : load[2] === 'M' ? 1e6 : 1;
+    conditions.push({ id: 'load_resistance', label: 'load resistance', value: Number(load[1]) * multiplier, unit: 'Ω', source: load[0].trim() });
+  }
+  add('load_capacitance', 'load capacitance', /(?:\bC[ _-]?L\b|load capacitance)\s*(?:=|at|of)?\s*(\d+(?:\.\d+)?)\s*(pF|nF|uF|µF)\b/i);
+  add('frequency', 'measurement frequency', /(?:\bat\s*|\bf\s*=\s*)(\d+(?:\.\d+)?)\s*(Hz|kHz|MHz)\b/i);
+  add('input_amplitude', 'input amplitude', /(?:\bV(?:IN|I|ID)\b|input(?:\s+amplitude)?)\s*(?:=|at|of)?\s*(\d+(?:\.\d+)?)\s*(m?V(?:pp|rms)?)\b/i);
+  return conditions;
+}
+
 function adaptDataSheetRequirement(requirement) {
   const adapter = measurementAdapterFor(requirement.metric) || measurementAdapterFor(requirement.source);
   if (!adapter) return { ...requirement, unmapped: true, adapter: null };
@@ -365,6 +388,7 @@ function adaptDataSheetRequirement(requirement) {
     metric: adapter.metric,
     testType: adapter.testType,
     unmapped: false,
+    conditions: requirement.conditions || extractTestConditions(requirement.source),
     adapter: { metric: adapter.metric, testType: adapter.testType, plan: adapter.plan, status: 'planned' }
   };
 }
@@ -1315,7 +1339,8 @@ function buildMeasurementPlan(ledger = []) {
     target: item.operator + ' ' + item.value + (item.unit ? ' ' + item.unit : ''),
     status: item.adapter ? 'testbench-planned' : item.reviewOnly ? 'classification-required' : 'adapter-required',
     testType: item.adapter?.testType || item.testType || 'manual',
-    procedure: item.adapter?.plan || 'Classify the source requirement before constructing a deterministic test.'
+    procedure: item.adapter?.plan || 'Classify the source requirement before constructing a deterministic test.',
+    conditions: item.conditions || []
   }));
 }
 
@@ -1343,6 +1368,10 @@ function makeTestbench(template, spec, pdkProfile, ledger = []) {
     // their stimulus/load conditions are completed by the circuit family
     // adapter before a physical sign-off run.
     common.push('* adapter ' + adapter.metric + ': ' + adapter.plan);
+    for (const condition of item.conditions || []) {
+      common.push('* condition ' + condition.label + ' = ' + condition.value + ' ' + condition.unit + ' (' + condition.source + ')');
+      if (condition.id === 'temperature') common.push('.temp ' + condition.value);
+    }
     if (adapter.metric === 'gain') common.push('.meas ac gain_db FIND vdb(vout) AT=10');
     if (adapter.metric === 'supply_current') common.push('.meas op supply_current PARAM = -i(VDD)');
     if (adapter.metric === 'power') common.push('.meas op supply_power PARAM = -v(vdd)*i(VDD)');
@@ -1370,20 +1399,38 @@ function makePdg(template, ledger = []) {
   }));
   nodes.push(...roleTasks);
   const roleDependencies = roleTasks.map((node) => node.id);
-  const testNodes = new Map();
   for (const item of ledger) {
-    const testType = item.testType || 'manual';
-    const testId = 'test_' + testType.replace(/[^a-z0-9_]/gi, '_');
-    if (!testNodes.has(testId)) {
-      const dependsOn = testType === 'ac' ? roleDependencies.concat(['bias_settle'])
-        : testType === 'noise' ? roleDependencies.concat(['bias_settle'])
-          : testType === 'transient' ? roleDependencies.concat(['bias_settle'])
-            : testType === 'op' ? ['bias_settle'] : roleDependencies;
-      testNodes.set(testId, { id: testId, kind: 'analysis', analysis: testType, dependsOn, ports: ['in', 'out', 'vdd', 'gnd'] });
-    }
-    nodes.push({ id: 'assert_' + item.id, kind: 'assertion', metric: item.metric, ledgerId: item.id, dependsOn: [testId], ports: ['out'] });
+    const testType = item.adapter?.testType || item.testType || 'manual';
+    const suffix = String(item.id).replace(/[^a-z0-9_]/gi, '_');
+    const conditionNodes = (item.conditions || []).map((condition, index) => {
+      const conditionId = 'condition_' + suffix + '_' + condition.id + '_' + index;
+      const supplyCondition = condition.id === 'supply';
+      nodes.push({
+        id: conditionId,
+        kind: 'condition_stimulus',
+        condition,
+        ledgerId: item.id,
+        dependsOn: supplyCondition ? [] : ['power_up'],
+        ports: condition.id.startsWith('load') ? ['out', 'gnd'] : condition.id === 'input_amplitude' ? ['in', 'gnd'] : ['vdd', 'gnd']
+      });
+      return conditionId;
+    });
+    const dependsOn = testType === 'op'
+      ? ['bias_settle'].concat(conditionNodes)
+      : roleDependencies.concat(['bias_settle'], conditionNodes);
+    const testId = 'test_' + suffix;
+    nodes.push({
+      id: testId,
+      kind: item.adapter ? 'analysis' : 'classification_review',
+      analysis: testType,
+      adapter: item.adapter?.metric || null,
+      procedure: item.adapter?.plan || 'classify document clause',
+      ledgerId: item.id,
+      dependsOn: [...new Set(dependsOn)],
+      ports: ['in', 'out', 'vdd', 'gnd']
+    });
+    nodes.push({ id: 'assert_' + suffix, kind: 'assertion', metric: item.metric, ledgerId: item.id, dependsOn: [testId], ports: ['out'] });
   }
-  nodes.splice(2 + roleTasks.length, 0, ...testNodes.values());
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const indegree = new Map(nodes.map((node) => [node.id, node.dependsOn.length]));
   const ready = nodes.filter((node) => indegree.get(node.id) === 0).map((node) => node.id);
@@ -1401,7 +1448,10 @@ function makePdg(template, ledger = []) {
     edges: nodes.flatMap((node) => node.dependsOn.map((from) => ({ from, to: node.id, type: 'depends-on' }))),
     topologicalOrder: order,
     valid: order.length === nodes.length && [...byId.keys()].every((id) => byId.has(id)),
-    coverage: ledger.map((item) => ({ ledgerId: item.id, assertion: 'assert_' + item.id, test: 'test_' + (item.testType || 'manual').replace(/[^a-z0-9_]/gi, '_') }))
+    coverage: ledger.map((item) => {
+      const suffix = String(item.id).replace(/[^a-z0-9_]/gi, '_');
+      return { ledgerId: item.id, assertion: 'assert_' + suffix, test: 'test_' + suffix, conditions: item.conditions || [] };
+    })
   };
 }
 
