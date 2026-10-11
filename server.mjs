@@ -12,6 +12,7 @@ import { evaluateSymbolicOracle } from './engine/symbolic.mjs';
 import { detectNgspice, detectPdk, runNgspice } from './engine/simulator.mjs';
 import { buildResearchGraph, queryResearchGraph } from './engine/graphrag.mjs';
 import { callOpenRouterAgent, openRouterConfigured } from './engine/openrouter.mjs';
+import { assertNgspiceDeck, pdkKnowledgeScope, pdkTemplateCompatibility, resolvePdkProfile } from './engine/pdk-profile.mjs';
 
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
@@ -192,15 +193,16 @@ function inferredDataSheetCircuit(dataSheet) {
   return null;
 }
 
-function assessPlatformEligibility(template, spec) {
-  if (template.id !== 'class_d_audio_amp') return { compatible: true, reasons: [] };
+function assessPlatformEligibility(template, spec, pdkProfile) {
+  const pdkCompatibility = pdkTemplateCompatibility(pdkProfile, template, spec);
+  if (template.id !== 'class_d_audio_amp') return pdkCompatibility;
   const supplyMaximum = spec.dataSheet?.requirements?.find((item) => item.id === 'supply_max')?.value;
   const outputPower = spec.dataSheet?.requirements?.find((item) => item.id === 'output_power_typ')?.value;
-  const reasons = [];
+  const reasons = [...pdkCompatibility.reasons];
   if (Number(supplyMaximum) > 5) reasons.push(`requested PVDD up to ${supplyMaximum} V exceeds the bundled SKY130 low-voltage device domain`);
   if (Number(outputPower) > 1) reasons.push(`requested ${outputPower} W BTL output requires an external/high-voltage power-device PDK and load model`);
   reasons.push('THD+N, efficiency, switching-frequency, and protection verification require a Class-D switching/load testbench adapter');
-  return { compatible: false, reasons, requiredAdapter: 'class-d-power-stage + LC/load + thermal/protection verification adapter' };
+  return { compatible: false, reasons, requirements: pdkCompatibility.requirements, requiredAdapter: 'class-d-power-stage + LC/load + thermal/protection verification adapter' };
 }
 
 const SOURCE_CARDS = [
@@ -260,12 +262,13 @@ function researchSection(title) {
   }
 }
 
-function retrieveKnowledge(spec, template) {
+function retrieveKnowledge(spec, template, pdkProfile) {
   const query = [
     template.label,
     template.family,
     spec.prompt,
     spec.process,
+    pdkProfile.id,
     spec.gainTarget > 50 ? 'high gain compensation' : '',
     spec.powerTarget < 2 ? 'low power sizing' : '',
     template.id === 'sar_adc' ? 'ADC template constrained' : '',
@@ -292,7 +295,8 @@ function retrieveKnowledge(spec, template) {
     mode: existsSync(RESEARCH_NOTES_PATH) ? 'local GraphRAG (evidence graph traversal)' : 'embedded fallback knowledge',
     query: query.slice(0, 220),
     items: ranked,
-    graph: graphResult
+    graph: graphResult,
+    pdkScope: pdkKnowledgeScope(pdkProfile)
   };
 }
 
@@ -442,6 +446,7 @@ export function normalizeInput(input = {}) {
 
   return {
     circuit,
+    pdk: compactText(input.pdk, 'sky130A', 80),
     architectureMode: ['balanced', 'reliability', 'discovery'].includes(input.architectureMode)
       ? input.architectureMode
       : 'balanced',
@@ -654,7 +659,7 @@ function completeGrammarState(state, grammar, beamWidth) {
   return beam;
 }
 
-function buildCandidates(template, spec, seed, action = defaultSizingAction(template), architectureMode = 'balanced') {
+function buildCandidates(template, spec, seed, action = defaultSizingAction(template), architectureMode = 'balanced', pdkProfile) {
   const modeBias = architectureMode === 'discovery' ? 0.12 : architectureMode === 'reliability' ? -0.12 : 0;
   const grammar = topologyGrammar(template, clamp((Number(action.explorationBias) || 0) + modeBias, -0.2, 0.2));
   const baseline = template.netlistKind === 'generic'
@@ -667,11 +672,13 @@ function buildCandidates(template, spec, seed, action = defaultSizingAction(temp
         ? ['mod:pwm', 'driver:bootstrap', 'output:btl_lc']
       : ['sample:bootstrapped', 'cmp:strongarm', 'dac:binary'];
   const labelFor = (tokens) => tokens.map((token) => token.split(':')[1]).join(' + ');
+  const pdkCompatibility = pdkTemplateCompatibility(pdkProfile, template, spec);
   const rewardFor = (state) => {
     const tokenScore = state.priors.reduce((sum, prior) => sum + prior, 0) / state.priors.length;
     const complexityPenalty = state.tokens.some((token) => token.includes('cascode') || token.includes('doubletail')) ? 0.05 : 0;
+    const physicalPenalty = pdkCompatibility.compatible ? 0 : 0.35;
     const specPressure = clamp((spec.gainTarget + spec.ugbwTarget / 3) / 160, 0, 1) * 0.07;
-    return clamp(tokenScore - complexityPenalty + specPressure, 0, 1);
+    return clamp(tokenScore - complexityPenalty - physicalPenalty + specPressure, 0, 1);
   };
   const searchResult = runPuctSearch({
     initialState: { stage: 0, tokens: [], priors: [] },
@@ -709,10 +716,12 @@ function buildCandidates(template, spec, seed, action = defaultSizingAction(temp
       id: 'candidate-' + (index + 1),
       label: labelFor(result.state.tokens),
       templateMatch: matching ? 'validated template' : 'grammar-valid exploratory topology',
-      exportable: matching,
+      exportable: matching && pdkCompatibility.compatible,
       track: matching ? 'production' : 'research',
       promotionGate: matching
-        ? 'canonical template + PDG + symbolic oracle + simulation gate'
+        ? (pdkCompatibility.compatible
+          ? 'canonical template + PDK profile + PDG + symbolic oracle + simulation gate'
+          : 'blocked by installed PDK profile: ' + pdkCompatibility.reasons.join('; '))
         : 'requires interface-contract proof, generated testbench, symbolic/PDG pass, and physical SPICE measurement before canonicalization',
       prior: round(result.state.priors.reduce((sum, value) => sum + value, 0) / result.state.priors.length, 3),
       feasibility: round(result.reward, 3),
@@ -1072,10 +1081,10 @@ function runAgenticSizingCycle(template, spec, seed, selectedCandidate, plannerA
   };
 }
 
-function makeNetlist(template, spec, variables) {
+function makeNetlist(template, spec, variables, pdkProfile) {
   const byName = Object.fromEntries(variables.map((item) => [item.name, item.value]));
-  const pdkModelFile = process.env.PDK_MODEL_FILE || '<PDK_MODEL_FILE>';
-  const pdkCorner = process.env.PDK_CORNER || 'tt';
+  const pdkModelFile = process.env.PDK_MODEL_FILE || pdkProfile.modelFile || '<PDK_MODEL_FILE>';
+  const pdkCorner = process.env.PDK_CORNER || pdkProfile.corner;
   const header = [
     '* FUSION Analog Agent Studio - constrained template output',
     '* Review with a qualified simulator and foundry PDK before fabrication.',
@@ -1099,8 +1108,8 @@ function makeNetlist(template, spec, variables) {
   } else if (template.id === 'ldo') {
     body = [
       'VREF vref 0 DC 0.6',
-      'MERR ea vref fb 0 sky130_fd_pr__nfet_01v8 W=8u L=0.36u',
-      'MPASS vout ea vin vin sky130_fd_pr__pfet_01v8 W=' + byName['W(MPASS)'] + 'u L=' + byName['L(MPASS)'] + 'u',
+      'MERR ea vref fb 0 ' + pdkProfile.deviceModels.nmos + ' W=8u L=0.36u',
+      'MPASS vout ea vin vin ' + pdkProfile.deviceModels.pmos + ' W=' + byName['W(MPASS)'] + 'u L=' + byName['L(MPASS)'] + 'u',
       'RFB1 vout fb 900k',
       'RFB2 fb 0 300k',
       'CC ea 0 ' + byName.Cc + 'p',
@@ -1109,7 +1118,7 @@ function makeNetlist(template, spec, variables) {
   } else if (template.id === 'sar_adc') {
     body = [
       'VREFP vref 0 DC ' + byName.Vref,
-      'MSW sample vin clk 0 sky130_fd_pr__nfet_01v8 W=' + byName['W(MSW)'] + 'u L=0.18u',
+      'MSW sample vin clk 0 ' + pdkProfile.deviceModels.nmos + ' W=' + byName['W(MSW)'] + 'u L=0.18u',
       'C0 dac sample ' + byName.Cunit + 'f',
       'C1 dac sample ' + (byName.Cunit * 2) + 'f',
       'XCOMP dac vref dout vdd 0 strongarm_latch W=' + byName['W(MCOMP)'] + 'u',
@@ -1117,12 +1126,12 @@ function makeNetlist(template, spec, variables) {
     ];
   } else {
     body = [
-      'M1 n1 vinp tail 0 sky130_fd_pr__nfet_01v8 W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
-      'M2 n2 vinn tail 0 sky130_fd_pr__nfet_01v8 W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
-      'M3 n1 n1 vdd vdd sky130_fd_pr__pfet_01v8 W=12u L=0.36u',
-      'M4 n2 n1 vdd vdd sky130_fd_pr__pfet_01v8 W=12u L=0.36u',
-      'M5 tail vbias 0 0 sky130_fd_pr__nfet_01v8 W=5u L=0.72u',
-      'M6 vout n2 vdd vdd sky130_fd_pr__pfet_01v8 W=' + byName['W(M6)'] + 'u L=0.36u',
+      'M1 n1 vinp tail 0 ' + pdkProfile.deviceModels.nmos + ' W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
+      'M2 n2 vinn tail 0 ' + pdkProfile.deviceModels.nmos + ' W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
+      'M3 n1 n1 vdd vdd ' + pdkProfile.deviceModels.pmos + ' W=12u L=0.36u',
+      'M4 n2 n1 vdd vdd ' + pdkProfile.deviceModels.pmos + ' W=12u L=0.36u',
+      'M5 tail vbias 0 0 ' + pdkProfile.deviceModels.nmos + ' W=5u L=0.72u',
+      'M6 vout n2 vdd vdd ' + pdkProfile.deviceModels.pmos + ' W=' + byName['W(M6)'] + 'u L=0.36u',
       'CC vout n1 ' + byName.Cc + 'p',
       'RZ vout n1 ' + byName.Rz,
       'IBIAS vbias 0 DC ' + byName.Ibias + 'u'
@@ -1131,9 +1140,9 @@ function makeNetlist(template, spec, variables) {
   return header.concat(body).concat(['.end']).join('\n');
 }
 
-function makeTestbench(template, spec) {
+function makeTestbench(template, spec, pdkProfile) {
   const common = [
-    '* Generated testbench skeleton - fill PDK model and corners.',
+    '* Generated ngspice testbench for ' + pdkProfile.id + '; Spectre .scs syntax is not accepted.',
     '.op',
     '.ac dec 30 10 10G',
     '.tran 1n 20u',
@@ -1396,18 +1405,19 @@ function llmRequired() {
 function graphContext(knowledge) {
   return JSON.stringify({
     graph: knowledge.graph?.graphStats,
+    pdkScope: knowledge.pdkScope,
     evidence: (knowledge.graph?.nodes || []).map((node) => ({ title: node.title, evidence: node.evidence })),
     paths: knowledge.graph?.paths || []
   }).slice(0, 4500);
 }
 
-async function runOpenRouterArchitecture(spec, template, knowledge) {
+async function runOpenRouterArchitecture(spec, template, knowledge, pdkProfile) {
   const catalog = Object.values(TEMPLATE_LIBRARY).map((entry) => ({ id: entry.id, label: entry.label, family: entry.family }));
   const dataSheetLock = inferredDataSheetCircuit(spec.dataSheet);
   const result = await callOpenRouterAgent({
     name: 'Architect',
-    system: 'You are the Architect in an analog-circuit agent team. Use only GraphRAG evidence supplied by the server. Produce a functional decomposition and bounded topology hypotheses, never a SPICE netlist. Novelty is a research candidate only; deterministic gates control production export.',
-    prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\n${dataSheetLock ? `DATASHEET CLASSIFICATION LOCK: select ${dataSheetLock}; never substitute an OTA or unrelated circuit family.` : ''}\nArchitecture policy: ${spec.architectureMode} (reliability=canonical only, balanced=dual track, discovery=more research search).\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "functionalPartitions":["signal-path|bias-and-reference|stability-and-control"], "topologyHypotheses":["bounded grammar hint"], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
+    system: 'You are the Architect in an analog-circuit agent team. Use only GraphRAG evidence supplied by the server. Produce a functional decomposition and bounded topology hypotheses, never a SPICE netlist. Quantitative facts from other PDKs are invalid until re-characterized. Novelty is a research candidate only; deterministic gates control production export.',
+    prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nInstalled PDK profile: ${JSON.stringify({ id: pdkProfile.id, minChannelLengthUm: pdkProfile.minChannelLengthUm, nominalVoltages: pdkProfile.nominalVoltages, supportsOnChipInductorTopology: pdkProfile.supportsOnChipInductorTopology })}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\n${dataSheetLock ? `DATASHEET CLASSIFICATION LOCK: select ${dataSheetLock}; never substitute an OTA or unrelated circuit family.` : ''}\nArchitecture policy: ${spec.architectureMode} (reliability=canonical only, balanced=dual track, discovery=more research search).\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "functionalPartitions":["signal-path|bias-and-reference|stability-and-control"], "topologyHypotheses":["bounded grammar hint"], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
     schema: 'architecture-v1'
   });
   const selected = TEMPLATE_LIBRARY[dataSheetLock] || TEMPLATE_LIBRARY[result.output.circuit] || template;
@@ -1458,13 +1468,14 @@ async function runOpenRouterVerifier(spec, template, symbolicOracle, constraints
 export async function runDesignCycle(rawInput = {}) {
   const dataSheet = await parseDataSheet(rawInput.dataSheet);
   const spec = { ...normalizeInput(rawInput), dataSheet };
+  const pdkProfile = resolvePdkProfile(spec);
   const lockedDataSheetCircuit = inferredDataSheetCircuit(dataSheet);
   const requestedTemplate = TEMPLATE_LIBRARY[lockedDataSheetCircuit]
     || TEMPLATE_LIBRARY[spec.circuit]
     || TEMPLATE_LIBRARY[DEFAULT_INPUT.circuit];
   const planningIdentity = openRouterConfigured() ? 'openrouter:' + process.env.OPENROUTER_MODEL : 'llm-unconfigured';
   const cacheKey = createHash('sha256')
-    .update(JSON.stringify({ spec, planningIdentity, engine: 'graphrag-agent-loop-v3-datasheet' }))
+    .update(JSON.stringify({ spec, pdkProfile: pdkProfile.id, planningIdentity, engine: 'pdk-scoped-agent-loop-v4' }))
     .digest('hex');
   const cached = responseCache.get(cacheKey);
   if (cached && !llmRequired()) {
@@ -1480,17 +1491,17 @@ export async function runDesignCycle(rawInput = {}) {
     };
   }
 
-  const initialKnowledge = retrieveKnowledge(spec, requestedTemplate);
+  const initialKnowledge = retrieveKnowledge(spec, requestedTemplate, pdkProfile);
   if (llmRequired() && !openRouterConfigured()) {
     throw new Error('LLM agent loop is required. Configure OPENROUTER_API_KEY and OPENROUTER_MODEL.');
   }
   const architecture = llmRequired()
-    ? await runOpenRouterArchitecture(spec, requestedTemplate, initialKnowledge)
+    ? await runOpenRouterArchitecture(spec, requestedTemplate, initialKnowledge, pdkProfile)
     : { name: 'Architect', output: { circuit: requestedTemplate.id, rationale: 'test-only deterministic bypass', dataSheetLock: lockedDataSheetCircuit }, selectedTemplate: requestedTemplate };
   const template = architecture.selectedTemplate;
   const effectiveSpec = { ...mergeExtractedSpec(spec, architecture.output.extractedSpec), circuit: template.id };
   const specificationLedger = buildSpecLedger(effectiveSpec, architecture.output.specificationLedger, spec.naturalRequest);
-  const knowledge = retrieveKnowledge(effectiveSpec, template);
+  const knowledge = retrieveKnowledge(effectiveSpec, template, pdkProfile);
   const topologyPolicy = buildTopologyPolicy(template, effectiveSpec);
   const planningHierarchy = buildHierarchicalPlan(template, effectiveSpec, defaultSizingAction(template));
   const fallbackPlan = makePlannerFallback(template, effectiveSpec);
@@ -1498,11 +1509,11 @@ export async function runDesignCycle(rawInput = {}) {
     ? await runOpenRouterPlanner(effectiveSpec, template, knowledge, architecture, planningHierarchy)
     : await optionalOpenAIPlanner(effectiveSpec, template, fallbackPlan);
   const hierarchy = buildHierarchicalPlan(template, effectiveSpec, planner.action);
-  const topologySearch = buildCandidates(template, effectiveSpec, cacheKey, planner.action, effectiveSpec.architectureMode);
+  const topologySearch = buildCandidates(template, effectiveSpec, cacheKey, planner.action, effectiveSpec.architectureMode, pdkProfile);
   const candidates = topologySearch.candidates;
   const selected = candidates.find((candidate) => candidate.status === 'selected') || candidates[0];
   let sizing = runAgenticSizingCycle(template, effectiveSpec, cacheKey, selected, planner.action, specificationLedger);
-  const platformEligibility = assessPlatformEligibility(template, effectiveSpec);
+  const platformEligibility = assessPlatformEligibility(template, effectiveSpec, pdkProfile);
   if (!platformEligibility.compatible) {
     sizing.constraints.push({
       id: 'platform_compatibility', label: 'PDK / verification-adapter compatibility',
@@ -1540,16 +1551,19 @@ export async function runDesignCycle(rawInput = {}) {
     ? await runOpenRouterVerifier(effectiveSpec, template, symbolicOracle, sizing.constraints, pdg)
     : { name: 'Verifier', output: { llmVerdict: 'pass', riskSummary: 'test-only deterministic bypass', testIntent: [] } };
   const exportsAllowed = sizing.verified && platformEligibility.compatible && symbolicOracle.available && symbolicOracle.allPassed;
-  const exportedNetlist = exportsAllowed ? makeNetlist(template, effectiveSpec, sizing.variables) : null;
-  const exportedTestbench = exportsAllowed ? makeTestbench(template, effectiveSpec) : null;
+  const exportedNetlist = exportsAllowed ? makeNetlist(template, effectiveSpec, sizing.variables, pdkProfile) : null;
+  const exportedTestbench = exportsAllowed ? makeTestbench(template, effectiveSpec, pdkProfile) : null;
   const ngspice = await detectNgspice();
   const pdk = await detectPdk();
   let simulation = ngspice.available && pdk.available
     ? { mode: 'not-run', status: ngspice, pdk, metrics: null, diagnostics: 'ngspice and PDK are ready; simulation is withheld until all requirements pass the export gate' }
     : { mode: 'analytic-surrogate', status: ngspice, pdk, metrics: null, diagnostics: 'ngspice or PDK unavailable; analytic model used for optimization only' };
+  let simulationAdapter = { dialect: pdkProfile.dialect, status: 'not-run', detail: 'No exported deck' };
   if (ngspice.available && pdk.available && exportedNetlist && exportedTestbench) {
     const deck = exportedNetlist.replace(/\n\.end\s*$/i, '\n' + exportedTestbench + '\n.end');
-    simulation = await runNgspice(deck);
+    const adapted = assertNgspiceDeck(deck, pdkProfile);
+    simulationAdapter = { dialect: adapted.dialect, status: 'accepted', detail: adapted.adapter };
+    simulation = await runNgspice(adapted.deck);
   }
   const baseResult = {
     id: randomUUID(),
@@ -1568,6 +1582,16 @@ export async function runDesignCycle(rawInput = {}) {
       fabricationSafe: false
     },
     spec: effectiveSpec,
+    pdkProfile: {
+      id: pdkProfile.id,
+      label: pdkProfile.label,
+      minChannelLengthUm: pdkProfile.minChannelLengthUm,
+      nominalVoltages: pdkProfile.nominalVoltages,
+      maxValidatedVoltage: pdkProfile.maxValidatedVoltage,
+      simulator: pdkProfile.simulator,
+      knowledgeScope: pdkKnowledgeScope(pdkProfile),
+      constraints: pdkProfile.notes
+    },
     dataSheet,
     planner,
     agentLoop: { architecture, planner, critic, verifier, hierarchy, topologyPolicy, required: llmRequired(), provider: 'OpenRouter' },
@@ -1602,6 +1626,7 @@ export async function runDesignCycle(rawInput = {}) {
     netlist: exportedNetlist,
     testbench: exportedTestbench,
     simulation,
+    simulationAdapter,
     symbolicOracle,
     cache: { hit: false, key: cacheKey.slice(0, 10), savedEvaluations: 0 },
     verification: {

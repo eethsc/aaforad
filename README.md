@@ -100,6 +100,16 @@ OpenRouter의 OpenAI-compatible Chat Completions API를 서버에서만 호출�
 - **Cadence**: 유효한 Virtuoso/Maestro 설치 및 라이선스, `CADENCE_PROJECT_DIR`, 쓰기 가능한 `AGENTIC_SIZING_CADENCE_WORK_ROOT`가 필요합니다.
 - **OpenRouter agent loop**: 위의 `OPENROUTER_API_KEY`, 사용 가능한 `OPENROUTER_MODEL`이 필요합니다.
 
+## PDK 인지형 설계 계약
+
+설계 엔진은 논문에서 가져온 알고리즘과 수치 지식을 분리합니다. 기본 `sky130A` 프로파일은 130 nm, 1.8/3.3 V, ngspice deck 및 `sky130_fd_pr__nfet_01v8`/`pfet_01v8` 소자 어휘를 선언합니다. 따라서 다음 항목은 자동으로 production export 경로에서 제외됩니다.
+
+- GPDK-45/TSMC-65에서 추출한 W/L bound 또는 substructure-parameter-performance 수치 facts. Sky130 시뮬레이션으로 다시 특성화돼야 합니다.
+- Spectre `.scs` 문법과 `simulator lang=spectre`, `ahdl_include` 같은 Spectre 전용 지시문. ngspice adapter가 명시적으로 거부합니다.
+- 이상 스위치와 온칩 인덕터를 전제로 한 converter topology. SKY130 profile에서는 외부 수동소자/별도 adapter 요구사항으로 표시됩니다.
+
+결과 JSON의 `pdkProfile`, `retrieval.pdkScope`, `simulationAdapter`는 이 결정의 근거를 보여줍니다. 외부 PDK를 고르면 해당 모델·소자 vocabulary·simulator adapter가 설치되기 전까지 export가 차단됩니다.
+
 이 구조는 [agentic-analog-sizing](https://github.com/aprilaihub/agentic-analog-sizing)의 mock/real adapter 분리와 역할 기반 workflow, 그리고 [AaLLM](https://anonymous.4open.science/r/AaLLM/README.md)의 사양→토폴로지→사이징 폐루프를 참고해 독립적으로 구현했습니다. 외부 저장소 코드를 복사하거나 실행하지 않습니다.
 
 ## 주요 파일
