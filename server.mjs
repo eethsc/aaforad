@@ -380,6 +380,37 @@ function extractTestConditions(source) {
   return conditions;
 }
 
+function mergeTestConditions(inherited = [], local = []) {
+  const merged = new Map();
+  for (const condition of inherited) merged.set(condition.id, condition);
+  // A row-level condition is more specific than a document-level condition.
+  for (const condition of local) merged.set(condition.id, condition);
+  return [...merged.values()];
+}
+
+function isNonElectricalClause(text) {
+  return /\b(?:package|packaging|pin(?:out| configuration)?|ordering(?: information| code)?|tape|reel|marking|dimension|footprint|land pattern|thermal resistance|θ(?:ja|jc)|theta[_ -]?(?:ja|jc)|storage temperature|moisture|solder|lead finish|weight)\b/i.test(text);
+}
+
+function isElectricalCandidate(text) {
+  if (isNonElectricalClause(text)) return false;
+  return /\b(?:voltage|current|power|gain|bandwidth|frequency|noise|slew|settling|offset|bias|cmrr|psrr|swing|distortion|thd|snr|efficiency|temperature|supply|vdd|vcc|output|input|load|impedance|resistance|capacitance)\b/i.test(text);
+}
+
+function extractGlobalTestConditions(lines) {
+  const conditions = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const lower = line.toLowerCase();
+    const globalMarker = /unless otherwise (?:noted|specified)|test conditions?|electrical characteristics|recommended operating conditions|all voltages.*referenced/.test(lower);
+    if (!globalMarker) continue;
+    // pdftotext may place the heading and its condition line separately.
+    const window = lines.slice(index, index + 4).join(' ');
+    conditions.push(...extractTestConditions(window));
+  }
+  return mergeTestConditions([], conditions);
+}
+
 function adaptDataSheetRequirement(requirement) {
   const adapter = measurementAdapterFor(requirement.metric) || measurementAdapterFor(requirement.source);
   if (!adapter) return { ...requirement, unmapped: true, adapter: null };
@@ -458,6 +489,7 @@ function extractGenericDataSheetRequirements(text, fileName) {
   const lines = text.split(/\r?\n/).map((line) => compactText(line, '', 360)).filter(Boolean);
   const requirements = extractSupplyRangeRequirements(lines, fileName);
   const reviewCandidates = [];
+  const globalConditions = extractGlobalTestConditions(lines);
   const seen = new Set();
   const numeric = /(-?\d+(?:\.\d+)?)\s*-?\s*(MHz|kHz|GHz|nV\s*\/\s*√?Hz|V\s*\/\s*[µu]s|mV|mA|µA|uA|pA|mW|W|V|dB|°C|%|ns|us|µs)/i;
   for (const line of lines) {
@@ -466,7 +498,7 @@ function extractGenericDataSheetRequirements(text, fileName) {
     const adapter = measurementAdapterFor(line);
     const source = compactText(line, fileName, 240);
     if (!adapter) {
-      if (reviewCandidates.length < 12 && !reviewCandidates.includes(source)) reviewCandidates.push(source);
+      if (isElectricalCandidate(source) && reviewCandidates.length < 12 && !reviewCandidates.includes(source)) reviewCandidates.push(source);
       continue;
     }
     // Supply is parsed above because a table's Min/Typ/Max columns and a
@@ -475,7 +507,7 @@ function extractGenericDataSheetRequirements(text, fileName) {
     const key = adapter.metric + '|' + match[1] + '|' + match[2].toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    requirements.push(adaptDataSheetRequirement(dataSheetRequirement(
+    const adapted = adaptDataSheetRequirement(dataSheetRequirement(
       'parsed_' + requirements.length,
       adapter.metric,
       detectRequirementOperator(line, adapter.metric),
@@ -483,9 +515,17 @@ function extractGenericDataSheetRequirements(text, fileName) {
       match[2].replace(/\s+/g, ''),
       adapter.testType,
       source
-    )));
+    ));
+    requirements.push({ ...adapted, conditions: mergeTestConditions(globalConditions, adapted.conditions) });
   }
-  return { requirements, reviewCandidates };
+  return {
+    requirements: requirements.map((item) => ({
+      ...item,
+      conditions: mergeTestConditions(globalConditions, item.conditions || [])
+    })),
+    reviewCandidates,
+    globalConditions
+  };
 }
 
 function extractDataSheetRequirements(text, fileName) {
@@ -580,6 +620,7 @@ async function parseDataSheet(input) {
   const extracted = extractDataSheetRequirements(text, fileName);
   const requirements = (Array.isArray(extracted) ? extracted : extracted.requirements).map(adaptDataSheetRequirement);
   const reviewCandidates = Array.isArray(extracted) ? [] : extracted.reviewCandidates;
+  const globalConditions = Array.isArray(extracted) ? [] : extracted.globalConditions;
   return {
     fileName,
     mimeType: compactText(input.mimeType, extension === '.pdf' ? 'application/pdf' : 'text/plain', 80),
@@ -587,6 +628,7 @@ async function parseDataSheet(input) {
     extractedCharacters: text.length,
     requirements,
     reviewCandidates,
+    globalConditions,
     parser: /tlv271/i.test(text)
       ? 'TI TLV271 deterministic profile'
       : /tpa311[68]d2/i.test(text)
@@ -764,7 +806,12 @@ function buildSpecLedger(spec, llmLedger, naturalRequest) {
       if (existing.metric === item.metric && String(existing.source || '').startsWith('LLM extracted')) ledger.delete(key);
     }
     const adapted = adaptDataSheetRequirement(item);
-    ledger.set('datasheet_' + item.id, { ...adapted, id: 'datasheet_' + item.id, source: item.source + ' · uploaded ' + spec.dataSheet.fileName });
+    ledger.set('datasheet_' + item.id, {
+      ...adapted,
+      id: 'datasheet_' + item.id,
+      conditions: mergeTestConditions(spec.dataSheet.globalConditions || [], adapted.conditions || []),
+      source: item.source + ' · uploaded ' + spec.dataSheet.fileName
+    });
   }
   for (const candidate of spec.dataSheet?.reviewCandidates || []) {
     ledger.set('review_' + ledger.size, {
@@ -1440,51 +1487,103 @@ function makeTestbench(template, spec, pdkProfile, ledger = []) {
   return common.join('\n');
 }
 
+function pdgConditionKey(conditions = []) {
+  return JSON.stringify([...conditions]
+    .map(({ id, value, unit }) => ({ id, value, unit }))
+    .sort((left, right) => left.id.localeCompare(right.id)));
+}
+
+function pdgAnalysisOrder(testType) {
+  return ({ op: 0, dc_sweep: 1, ac: 2, noise: 3, transient: 4, fft: 5, temperature_sweep: 6, manual: 7 })[testType] ?? 8;
+}
+
 function makePdg(template, ledger = []) {
   const nodes = [
     { id: 'power_up', kind: 'stimulus', dependsOn: [], ports: ['vdd', 'gnd'] },
-    { id: 'bias_settle', kind: 'settle', dependsOn: ['power_up'], ports: ['vdd', 'gnd'] }
+    { id: 'topology_ready', kind: 'structural_ready', dependsOn: ['power_up'], ports: template.nodes.filter((node) => node.kind !== 'ground').map((node) => node.id) }
   ];
   const roleTasks = template.roles.map(([role]) => ({
     id: 'role_' + role,
     kind: 'substructure_settle',
-    dependsOn: ['bias_settle'],
+    dependsOn: ['topology_ready'],
     ports: template.nodes.filter((node) => node.kind !== 'ground').map((node) => node.id),
     role
   }));
   nodes.push(...roleTasks);
   const roleDependencies = roleTasks.map((node) => node.id);
+  const contexts = new Map();
   for (const item of ledger) {
-    const testType = item.adapter?.testType || item.testType || 'manual';
-    const suffix = String(item.id).replace(/[^a-z0-9_]/gi, '_');
-    const conditionNodes = (item.conditions || []).map((condition, index) => {
-      const conditionId = 'condition_' + suffix + '_' + condition.id + '_' + index;
-      const supplyCondition = condition.id === 'supply';
-      nodes.push({
-        id: conditionId,
-        kind: 'condition_stimulus',
-        condition,
-        ledgerId: item.id,
-        dependsOn: supplyCondition ? [] : ['power_up'],
-        ports: condition.id.startsWith('load') ? ['out', 'gnd'] : condition.id === 'input_amplitude' ? ['in', 'gnd'] : ['vdd', 'gnd']
-      });
-      return conditionId;
-    });
-    const dependsOn = testType === 'op'
-      ? ['bias_settle'].concat(conditionNodes)
-      : roleDependencies.concat(['bias_settle'], conditionNodes);
-    const testId = 'test_' + suffix;
+    const conditions = item.conditions || [];
+    const key = pdgConditionKey(conditions);
+    if (!contexts.has(key)) contexts.set(key, { conditions, items: [] });
+    contexts.get(key).items.push(item);
+  }
+  const coverage = [];
+  let contextIndex = 0;
+  for (const context of contexts.values()) {
+    const contextId = 'context_' + (++contextIndex);
     nodes.push({
-      id: testId,
-      kind: item.adapter ? 'analysis' : 'classification_review',
-      analysis: testType,
-      adapter: item.adapter?.metric || null,
-      procedure: item.adapter?.plan || 'classify document clause',
-      ledgerId: item.id,
-      dependsOn: [...new Set(dependsOn)],
+      id: contextId,
+      kind: 'condition_context',
+      conditions: context.conditions,
+      dependsOn: ['power_up'],
       ports: ['in', 'out', 'vdd', 'gnd']
     });
-    nodes.push({ id: 'assert_' + suffix, kind: 'assertion', metric: item.metric, ledgerId: item.id, dependsOn: [testId], ports: ['out'] });
+    const biasId = 'bias_settle_' + contextIndex;
+    nodes.push({
+      id: biasId,
+      kind: 'settle',
+      contextId,
+      dependsOn: [contextId, ...roleDependencies],
+      ports: ['vdd', 'gnd']
+    });
+    const analyses = new Map();
+    for (const item of context.items) {
+      const testType = item.adapter?.testType || item.testType || 'manual';
+      if (!analyses.has(testType)) analyses.set(testType, []);
+      analyses.get(testType).push(item);
+    }
+    let previous = biasId;
+    const testIds = new Map();
+    for (const [testType, items] of [...analyses.entries()].sort(([left], [right]) => pdgAnalysisOrder(left) - pdgAnalysisOrder(right))) {
+      const testId = 'test_' + testType.replace(/[^a-z0-9_]/gi, '_') + '_' + contextIndex;
+      nodes.push({
+        id: testId,
+        kind: items.some((item) => item.adapter) ? 'analysis' : 'classification_review',
+        analysis: testType,
+        contextId,
+        metrics: items.map((item) => item.metric),
+        procedures: [...new Set(items.map((item) => item.adapter?.plan || 'classify document clause'))],
+        dependsOn: [previous],
+        ports: ['in', 'out', 'vdd', 'gnd']
+      });
+      previous = testId;
+      testIds.set(testType, testId);
+    }
+    for (const [testType, items] of analyses) {
+      const testId = testIds.get(testType);
+      const assertionGroupId = 'assertions_' + testType.replace(/[^a-z0-9_]/gi, '_') + '_' + contextIndex;
+      nodes.push({
+        id: assertionGroupId,
+        kind: 'assertion_group',
+        testType,
+        contextId,
+        metrics: items.map((item) => item.metric),
+        assertions: items.map((item) => ({ ledgerId: item.id, metric: item.metric, target: item.operator + ' ' + item.value + (item.unit ? ' ' + item.unit : '') })),
+        dependsOn: [testId],
+        ports: ['out']
+      });
+      for (const item of items) {
+        coverage.push({
+          ledgerId: item.id,
+          assertion: assertionGroupId,
+          assertionMember: item.id,
+          test: testId,
+          context: contextId,
+          conditions: context.conditions
+        });
+      }
+    }
   }
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const indegree = new Map(nodes.map((node) => [node.id, node.dependsOn.length]));
@@ -1503,10 +1602,13 @@ function makePdg(template, ledger = []) {
     edges: nodes.flatMap((node) => node.dependsOn.map((from) => ({ from, to: node.id, type: 'depends-on' }))),
     topologicalOrder: order,
     valid: order.length === nodes.length && [...byId.keys()].every((id) => byId.has(id)),
-    coverage: ledger.map((item) => {
-      const suffix = String(item.id).replace(/[^a-z0-9_]/gi, '_');
-      return { ledgerId: item.id, assertion: 'assert_' + suffix, test: 'test_' + suffix, conditions: item.conditions || [] };
-    })
+    coverage,
+    clusters: {
+      contexts: contexts.size,
+      analyses: nodes.filter((node) => node.kind === 'analysis').length,
+      assertionGroups: nodes.filter((node) => node.kind === 'assertion_group').length,
+      assertions: ledger.length
+    }
   };
 }
 
@@ -2078,7 +2180,8 @@ export function createApp() {
             fileName: dataSheet.fileName,
             parser: dataSheet.parser,
             requirements: dataSheet.requirements,
-            reviewCandidates: dataSheet.reviewCandidates
+            reviewCandidates: dataSheet.reviewCandidates,
+            globalConditions: dataSheet.globalConditions
           },
           contract: dataSheetContract(spec, pdkProfile)
         });

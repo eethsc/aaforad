@@ -428,13 +428,13 @@ function renderPdgGraph(pdg, specCoverage) {
   const renderedNodes = nodes.map((node) => {
     const pos = nodePositions.get(node.id);
     if (!pos) return '';
-    const isAssertion = node.kind === 'assertion';
+    const isAssertion = node.kind === 'assertion' || node.kind === 'assertion_group';
     const isAnalysis = node.kind === 'analysis';
     const isCondition = node.kind === 'condition_stimulus';
     const rectColor = isAssertion ? 'rgba(227, 179, 65, 0.2)' : isAnalysis ? 'rgba(59, 130, 246, 0.2)' : isCondition ? 'rgba(139, 92, 246, 0.2)' : 'rgba(0, 184, 150, 0.2)';
     const strokeColor = isAssertion ? '#e3b341' : isAnalysis ? '#3b82f6' : isCondition ? '#8b5cf6' : '#00b896';
     const title = escapeHtml(node.id.replace(/_/g, ' '));
-    const label = escapeHtml((node.condition?.label || node.metric || node.kind || '').slice(0, 12));
+    const label = escapeHtml((node.condition?.label || node.metric || (node.kind === 'assertion_group' ? node.metrics?.join(', ') : node.kind) || '').slice(0, 12));
 
     return `<g class="pdg-node" transform="translate(${pos.x - 42}, ${pos.y - 16})">
       <rect width="84" height="32" rx="6" fill="${rectColor}" stroke="${strokeColor}" stroke-width="1.2" />
