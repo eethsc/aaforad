@@ -17,6 +17,7 @@ import { assertNgspiceDeck, pdkKnowledgeScope, pdkTemplateCompatibility, resolve
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const RESEARCH_NOTES_PATH = path.join(ROOT_DIR, 'analog_design_agentic_ai_papers.md');
+const PDF_TABLE_EXTRACTOR_PATH = path.join(ROOT_DIR, 'engine', 'datasheet_pdf_extract.py');
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const MAX_DATASHEET_BYTES = 7 * 1024 * 1024;
 const responseCache = new Map();
@@ -485,9 +486,79 @@ function extractSupplyRangeRequirements(lines, fileName) {
   return requirements;
 }
 
-function extractGenericDataSheetRequirements(text, fileName) {
+function tableNumber(value) {
+  const match = String(value || '').replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+function tableUnit(row, unitIndex) {
+  const direct = unitIndex >= 0 ? String(row[unitIndex] || '') : '';
+  const joined = row.join(' ');
+  return (direct.match(/(?:nV\s*\/\s*√?Hz|V\s*\/\s*[µu]s|mV|µV|nA|µA|mA|pA|MHz|kHz|GHz|dB|°C|mW|W|V|%|ns|µs|us)/i)
+    || joined.match(/(?:nV\s*\/\s*√?Hz|V\s*\/\s*[µu]s|mV|µV|nA|µA|mA|pA|MHz|kHz|GHz|dB|°C|mW|W|V|%|ns|µs|us)/i))?.[0]?.replace(/\s+/g, '') || '';
+}
+
+function extractTableRequirements(tables, fileName) {
+  const requirements = [];
+  for (const table of Array.isArray(tables) ? tables : []) {
+    const rows = (table.rows || []).map((row) => row.map((cell) => compactText(String(cell || ''), '', 240)));
+    const headerIndex = rows.findIndex((row) => row.some((cell) => /^min(?:imum)?$/i.test(cell))
+      && row.some((cell) => /^max(?:imum)?$/i.test(cell)));
+    if (headerIndex < 0) continue;
+    const headers = rows[headerIndex].map((cell) => cell.toLowerCase());
+    const column = (pattern) => headers.findIndex((cell) => pattern.test(cell));
+    const minIndex = column(/^min(?:imum)?$/);
+    const typIndex = column(/^typ(?:ical)?$/);
+    const maxIndex = column(/^max(?:imum)?$/);
+    const unitIndex = column(/unit/);
+    const conditionIndex = column(/condition|test/);
+    const firstValueIndex = [minIndex, typIndex, maxIndex].filter((index) => index >= 0).sort((left, right) => left - right)[0];
+    for (const row of rows.slice(headerIndex + 1)) {
+      if (!row.length || row.every((cell) => !cell)) continue;
+      const descriptor = row.slice(0, Math.max(1, firstValueIndex)).filter(Boolean).join(' ');
+      if (!isElectricalCandidate(descriptor)) continue;
+      const adapter = measurementAdapterFor(descriptor);
+      if (!adapter) continue;
+      const unit = tableUnit(row, unitIndex);
+      const rowCondition = conditionIndex >= 0 ? row[conditionIndex] : '';
+      const source = `PDF table p.${table.page ?? '?'} r.${table.table ?? '?'}: ${row.filter(Boolean).join(' | ')}`;
+      for (const [grade, index, operator] of [['min', minIndex, '>='], ['typ', typIndex, '~='], ['max', maxIndex, '<=']]) {
+        const value = index >= 0 ? tableNumber(row[index]) : null;
+        if (!Number.isFinite(value)) continue;
+        const normalizedValue = adapter.metric === 'supply' ? voltageInVolts(value, unit) : value;
+        const requirement = adaptDataSheetRequirement(dataSheetRequirement(
+          `table_${table.page ?? 0}_${table.table ?? 0}_${requirements.length}`,
+          adapter.metric,
+          operator,
+          normalizedValue,
+          adapter.metric === 'supply' ? 'V' : unit,
+          adapter.testType,
+          source
+        ));
+        requirements.push({
+          ...requirement,
+          grade,
+          conditions: mergeTestConditions([], extractTestConditions(descriptor + ' ' + rowCondition))
+        });
+      }
+    }
+  }
+  return requirements;
+}
+
+function dedupeRequirements(requirements) {
+  const seen = new Set();
+  return requirements.filter((item) => {
+    const key = [item.metric, item.operator, item.value, item.unit, pdgConditionKey(item.conditions || [])].join('|');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function extractGenericDataSheetRequirements(text, fileName, tables = []) {
   const lines = text.split(/\r?\n/).map((line) => compactText(line, '', 360)).filter(Boolean);
-  const requirements = extractSupplyRangeRequirements(lines, fileName);
+  const requirements = extractSupplyRangeRequirements(lines, fileName).concat(extractTableRequirements(tables, fileName));
   const reviewCandidates = [];
   const globalConditions = extractGlobalTestConditions(lines);
   const seen = new Set();
@@ -519,16 +590,16 @@ function extractGenericDataSheetRequirements(text, fileName) {
     requirements.push({ ...adapted, conditions: mergeTestConditions(globalConditions, adapted.conditions) });
   }
   return {
-    requirements: requirements.map((item) => ({
+    requirements: dedupeRequirements(requirements.map((item) => ({
       ...item,
       conditions: mergeTestConditions(globalConditions, item.conditions || [])
-    })),
+    }))),
     reviewCandidates,
     globalConditions
   };
 }
 
-function extractDataSheetRequirements(text, fileName) {
+function extractDataSheetRequirements(text, fileName, tables = []) {
   const normalized = text.replace(/\s+/g, ' ').toLowerCase();
   // A deterministic profile keeps original supplier requirements distinct from
   // user wishes. It is deliberately fail-closed for metrics without a local
@@ -564,7 +635,7 @@ function extractDataSheetRequirements(text, fileName) {
       dataSheetRequirement('temperature_max', 'operating_temperature', '<=', 125, '°C', 'manual', 'TPA3116D2 datasheet: maximum junction/operating temperature', true)
     ];
   }
-  return extractGenericDataSheetRequirements(text, fileName);
+  return extractGenericDataSheetRequirements(text, fileName, tables);
 }
 
 function execFileText(command, args, options = {}) {
@@ -592,40 +663,62 @@ async function parseDataSheet(input) {
     throw error;
   }
   let text = '';
+  let tables = [];
   if (extension === '.pdf') {
-    let pdftotextExtracted = false;
+    let extracted = false;
     try {
       const tempBase = process.env.TMPDIR || os.tmpdir() || '.';
       const directory = await mkdtemp(path.join(tempBase, 'fusion-datasheet-'));
       const source = path.join(directory, 'source.pdf');
       try {
         await writeFile(source, bytes);
-        text = await execFileText('pdftotext', ['-layout', source, '-']);
-        pdftotextExtracted = true;
+        const python = process.env.PYTHON_PATH || 'python3';
+        const structured = JSON.parse(await execFileText(python, [PDF_TABLE_EXTRACTOR_PATH, source]));
+        text = String(structured.text || '');
+        tables = Array.isArray(structured.tables) ? structured.tables : [];
+        extracted = Boolean(text.trim());
       } finally {
         await rm(directory, { recursive: true, force: true }).catch(() => {});
       }
     } catch {
-      // pdftotext executable not present or failed
+      // Table extractor is optional for native installs; retain a text-only
+      // fallback for documents without extractable cell geometry.
+    }
+    if (!extracted) {
+      try {
+        const tempBase = process.env.TMPDIR || os.tmpdir() || '.';
+        const directory = await mkdtemp(path.join(tempBase, 'fusion-datasheet-'));
+        const source = path.join(directory, 'source.pdf');
+        try {
+          await writeFile(source, bytes);
+          text = await execFileText('pdftotext', ['-layout', source, '-']);
+          extracted = Boolean(text.trim());
+        } finally {
+          await rm(directory, { recursive: true, force: true }).catch(() => {});
+        }
+      } catch {
+        // pdftotext executable not present or failed
+      }
     }
 
-    if (!pdftotextExtracted || !text.trim()) {
-      const error = new Error('PDF text extraction failed. Install Poppler pdftotext or upload a text-based datasheet.');
+    if (!extracted || !text.trim()) {
+      const error = new Error('PDF extraction failed. Install pdfplumber or Poppler pdftotext, or upload a text-based datasheet.');
       error.statusCode = 422;
       throw error;
     }
   } else {
     text = bytes.toString('utf8');
   }
-  const extracted = extractDataSheetRequirements(text, fileName);
-  const requirements = (Array.isArray(extracted) ? extracted : extracted.requirements).map(adaptDataSheetRequirement);
-  const reviewCandidates = Array.isArray(extracted) ? [] : extracted.reviewCandidates;
-  const globalConditions = Array.isArray(extracted) ? [] : extracted.globalConditions;
+  const parsedRequirements = extractDataSheetRequirements(text, fileName, tables);
+  const requirements = (Array.isArray(parsedRequirements) ? parsedRequirements : parsedRequirements.requirements).map(adaptDataSheetRequirement);
+  const reviewCandidates = Array.isArray(parsedRequirements) ? [] : parsedRequirements.reviewCandidates;
+  const globalConditions = Array.isArray(parsedRequirements) ? [] : parsedRequirements.globalConditions;
   return {
     fileName,
     mimeType: compactText(input.mimeType, extension === '.pdf' ? 'application/pdf' : 'text/plain', 80),
     sha256: createHash('sha256').update(bytes).digest('hex').slice(0, 16),
     extractedCharacters: text.length,
+    extractedTables: tables.length,
     requirements,
     reviewCandidates,
     globalConditions,
@@ -633,7 +726,7 @@ async function parseDataSheet(input) {
       ? 'TI TLV271 deterministic profile'
       : /tpa311[68]d2/i.test(text)
         ? 'TI TPA3116D2 Class-D amplifier profile'
-        : 'universal measurement-plan extraction'
+        : tables.length ? 'pdfplumber table + universal measurement-plan extraction' : 'universal measurement-plan extraction'
   };
 }
 
