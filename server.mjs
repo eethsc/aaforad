@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runPuctSearch } from './engine/mcts.mjs';
 import { runParEgo } from './engine/parego.mjs';
@@ -710,6 +711,70 @@ async function parseDataSheet(input) {
     }
 
     if (!extracted || !text.trim()) {
+      // Decompress FlateDecode streams from PDF binary using built-in Node zlib
+      try {
+        const binaryString = bytes.toString('binary');
+        let decompressedText = '';
+        const extractedLines = [];
+        const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+        let streamMatch;
+        let pageCount = 0;
+        while ((streamMatch = streamRegex.exec(binaryString)) !== null) {
+          const rawStream = Buffer.from(streamMatch[1], 'binary');
+          let decomp = null;
+          try { decomp = zlib.inflateSync(rawStream); } catch {}
+          if (!decomp) {
+            try { decomp = zlib.inflateRawSync(rawStream); } catch {}
+          }
+          if (decomp) {
+            const streamStr = decomp.toString('utf8');
+            // Decode PDF text operators: (string) Tj, [array] TJ, etc.
+            const textChunks = [];
+            const tokenRegex = /\(([^)]*)\)\s*T[jJ]|\[([^\]]*)\]\s*TJ/g;
+            let tokenMatch;
+            while ((tokenMatch = tokenRegex.exec(streamStr)) !== null) {
+              if (tokenMatch[1] !== undefined) {
+                textChunks.push(tokenMatch[1].replace(/\\([()\\])/g, '$1'));
+              } else if (tokenMatch[2] !== undefined) {
+                const arrayParts = tokenMatch[2].match(/\(([^)]*)\)/g) || [];
+                const joined = arrayParts.map((p) => p.slice(1, -1).replace(/\\([()\\])/g, '$1')).join('');
+                if (joined) textChunks.push(joined);
+              }
+            }
+            if (textChunks.length) {
+              pageCount += 1;
+              const pageText = textChunks.join(' ');
+              decompressedText += pageText + '\n';
+              // Detect table rows by splitting text chunks into probable columns
+              const candidateRows = pageText.split(/(?:\r?\n| {3,})/).map((s) => s.trim()).filter(Boolean);
+              for (const line of candidateRows) {
+                const cells = line.split(/\t|\s{2,}/).map((c) => c.trim()).filter(Boolean);
+                if (cells.length >= 3) {
+                  extractedLines.push(cells);
+                }
+              }
+            }
+          }
+        }
+        if (decompressedText.trim().length > 50) {
+          text = decompressedText;
+          extracted = true;
+          if (extractedLines.length >= 2 && !tables.length) {
+            tables = [{ page: 1, table: 1, rows: extractedLines }];
+          }
+        } else {
+          const rawTextTokens = binaryString.match(/[a-zA-Z0-9_.-]{2,}/g) || [];
+          if (rawTextTokens.length > 50) {
+            text = rawTextTokens.join(' ');
+            extracted = true;
+          }
+        }
+      } catch {
+        // stream extraction fallback failed
+      }
+    }
+
+    if (!extracted || !text.trim()) {
       const error = new Error('PDF extraction failed. Install pdfplumber or Poppler pdftotext, or upload a text-based datasheet.');
       error.statusCode = 422;
       throw error;
@@ -734,7 +799,7 @@ async function parseDataSheet(input) {
       ? 'TI TLV271 deterministic profile'
       : /tpa311[68]d2/i.test(text)
         ? 'TI TPA3116D2 Class-D amplifier profile'
-        : tables.length ? 'pdfplumber table + universal measurement-plan extraction' : 'universal measurement-plan extraction'
+        : tables.length ? 'native stream table + universal measurement-plan extraction' : 'universal measurement-plan extraction'
   };
 }
 
