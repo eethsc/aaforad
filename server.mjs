@@ -13,6 +13,7 @@ import { detectNgspice, detectPdk, runNgspice } from './engine/simulator.mjs';
 import { buildResearchGraph, queryResearchGraph } from './engine/graphrag.mjs';
 import { callOpenRouterAgent, openRouterConfigured } from './engine/openrouter.mjs';
 import { assertNgspiceDeck, pdkKnowledgeScope, pdkTemplateCompatibility, resolvePdkProfile } from './engine/pdk-profile.mjs';
+import { extractFourViewKnowledge, persistSizingKnowledge, retrieveSizingKnowledge } from './engine/agentic_knowledge.mjs';
 
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
@@ -263,7 +264,7 @@ function researchSection(title) {
   }
 }
 
-function retrieveKnowledge(spec, template, pdkProfile) {
+async function retrieveKnowledge(spec, template, pdkProfile) {
   const query = [
     template.label,
     template.family,
@@ -292,12 +293,14 @@ function retrieveKnowledge(spec, template, pdkProfile) {
     return { ...source, score, evidence: evidence.slice(0, 260) };
   }).sort((left, right) => right.score - left.score);
 
+  const sizingKnowledge = await retrieveSizingKnowledge({ pdkId: pdkProfile.id, templateId: template.id });
   return {
     mode: existsSync(RESEARCH_NOTES_PATH) ? 'local GraphRAG (evidence graph traversal)' : 'embedded fallback knowledge',
     query: query.slice(0, 220),
     items: ranked,
     graph: graphResult,
-    pdkScope: pdkKnowledgeScope(pdkProfile)
+    pdkScope: pdkKnowledgeScope(pdkProfile),
+    sizingKnowledge
   };
 }
 
@@ -311,6 +314,11 @@ function compactText(value, fallback, maxLength) {
   if (typeof value !== 'string') return fallback;
   const trimmed = value.replace(/[\u0000-\u001f]/g, ' ').trim();
   return trimmed.slice(0, maxLength) || fallback;
+}
+
+function compactNetlist(value, maxLength = 120000) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\u0000/g, '').replace(/\r\n?/g, '\n').slice(0, maxLength).trim();
 }
 
 function dataSheetRequirement(id, metric, operator, value, unit, testType, source, unmapped = false) {
@@ -760,7 +768,47 @@ export function normalizeInput(input = {}) {
     searchBudget: Math.round(numberInRange(input.searchBudget, DEFAULT_INPUT.searchBudget, 8, 256)),
     prompt: compactText(input.prompt, '', 600),
     naturalRequest: compactText(input.naturalRequest, '', 6000),
+    netlist: compactNetlist(input.netlist),
     dataSheet: input.dataSheet || null
+  };
+}
+
+function deterministicNetlistDecomposition(netlist, template) {
+  const elements = String(netlist || '').split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('*') && !line.startsWith('.'))
+    .map((line) => {
+      const tokens = line.split(/\s+/);
+      return { name: tokens[0], kind: tokens[0]?.[0]?.toUpperCase(), nodes: tokens.slice(1, 5), source: line.slice(0, 300) };
+    });
+  const byRole = new Map();
+  const add = (role, element) => {
+    if (!byRole.has(role)) byRole.set(role, []);
+    byRole.get(role).push(element.name);
+  };
+  for (const element of elements) {
+    const text = (element.name + ' ' + element.nodes.join(' ')).toLowerCase();
+    // MOS source nodes often contain "tail"; gate/input evidence takes
+    // precedence so a differential pair is not mislabelled as bias circuitry.
+    if (/vin|inp|inn|in\+|in-/.test(text)) add('input_pair', element);
+    else if (/cc|comp|miller|cz|rz/.test(text) || element.kind === 'C') add('compensation', element);
+    else if (/bias|ibias|vbias|iref|mref/.test(text) || element.kind === 'I') add('bias', element);
+    else if (/fb|rf|r1|r2|sense/.test(text)) add('feedback', element);
+    else if (/out|vout/.test(text)) add('gain_stage', element);
+    else add('signal_path', element);
+  }
+  const substructures = [];
+  if ((byRole.get('input_pair') || []).length >= 2) substructures.push({ name: 'differential_pair', ownerRole: 'input_pair', evidence: byRole.get('input_pair') });
+  if ((byRole.get('compensation') || []).length) substructures.push({ name: 'compensation_network', ownerRole: 'compensation', evidence: byRole.get('compensation') });
+  if ((byRole.get('bias') || []).length) substructures.push({ name: 'bias_network', ownerRole: 'bias', evidence: byRole.get('bias') });
+  if ((byRole.get('feedback') || []).length) substructures.push({ name: 'feedback_network', ownerRole: 'feedback', evidence: byRole.get('feedback') });
+  if (!substructures.length) substructures.push({ name: 'unclassified_signal_path', ownerRole: template.roles[0][0], evidence: elements.slice(0, 12).map((item) => item.name) });
+  return {
+    source: 'deterministic SPICE connectivity parser',
+    elementCount: elements.length,
+    functionalRoles: [...byRole].map(([role, members]) => ({ role, members })),
+    substructures,
+    connectivity: elements.slice(0, 160)
   };
 }
 
@@ -1110,7 +1158,7 @@ function buildCandidates(template, spec, seed, action = defaultSizingAction(temp
   return { candidates, searchResult };
 }
 
-function buildHierarchicalPlan(template, spec, plannerAction) {
+function buildHierarchicalPlan(template, spec, plannerAction, decomposition = null) {
   const groups = new Map();
   for (const [role, label] of template.roles) {
     const domain = /bias|reference|feedback/.test(role) ? 'bias-and-reference'
@@ -1131,7 +1179,13 @@ function buildHierarchicalPlan(template, spec, plannerAction) {
           : 'stability, timing, phase margin'
     })),
     integrationGate: 'Coordinator may merge only bounded local actions; PDG and symbolic oracle own final acceptance.',
-    scale: template.roles.length >= 5 ? 'hierarchical required' : 'hierarchical available'
+    scale: template.roles.length >= 5 ? 'hierarchical required' : 'hierarchical available',
+    decomposition: decomposition ? {
+      source: decomposition.source,
+      elementCount: decomposition.elementCount,
+      functionalRoles: decomposition.functionalRoles,
+      substructures: decomposition.substructures
+    } : null
   };
 }
 
@@ -1905,17 +1959,86 @@ function graphContext(knowledge) {
     graph: knowledge.graph?.graphStats,
     pdkScope: knowledge.pdkScope,
     evidence: (knowledge.graph?.nodes || []).map((node) => ({ title: node.title, evidence: node.evidence })),
-    paths: knowledge.graph?.paths || []
+    paths: knowledge.graph?.paths || [],
+    // Learned only from runs under the same PDK/template key; it supplements
+    // the paper graph and never substitutes for simulator evidence.
+    sizingKnowledge: knowledge.sizingKnowledge?.records || []
   }).slice(0, 4500);
 }
 
-async function runOpenRouterArchitecture(spec, template, knowledge, pdkProfile) {
+async function runOpenRouterNetlistDecomposer(spec, template) {
+  const baseline = deterministicNetlistDecomposition(spec.netlist, template);
+  const allowedRoles = template.roles.map(([id]) => id);
+  const result = await callOpenRouterAgent({
+    name: 'Netlist Decomposer',
+    system: 'You are the AgenticSizing two-step decomposition agent. Analyze only the supplied SPICE netlist. First identify functional roles, then canonical substructures. Never modify, generate, or execute a netlist. Every ownerRole must be an allowed role.',
+    prompt: `Allowed roles: ${allowedRoles.join(', ')}\nTemplate context: ${template.label}\nDeterministic connectivity evidence: ${JSON.stringify(baseline.connectivity)}\nSPICE netlist:\n${spec.netlist}\nReturn JSON {"functionalRoles":[{"role":"allowed role","members":["element names"]}],"substructures":[{"name":"canonical structure","ownerRole":"allowed role","evidence":["element names"],"rationale":"string"}],"summary":"string"}.`,
+    schema: 'netlist-decomposition-v1',
+    temperature: 0.05
+  });
+  const functionalRoles = Array.isArray(result.output.functionalRoles) ? result.output.functionalRoles.map((entry) => ({
+    role: allowedRoles.includes(entry?.role) ? entry.role : template.roles[0][0],
+    members: Array.isArray(entry?.members) ? entry.members.map((item) => compactText(String(item), '', 80)).filter(Boolean).slice(0, 48) : []
+  })).slice(0, 32) : [];
+  const substructures = Array.isArray(result.output.substructures) ? result.output.substructures.map((entry) => ({
+    name: compactText(String(entry?.name || 'unclassified_substructure'), 'unclassified_substructure', 100),
+    ownerRole: allowedRoles.includes(entry?.ownerRole) ? entry.ownerRole : template.roles[0][0],
+    evidence: Array.isArray(entry?.evidence) ? entry.evidence.map((item) => compactText(String(item), '', 80)).filter(Boolean).slice(0, 48) : [],
+    rationale: compactText(String(entry?.rationale || ''), '', 240)
+  })).slice(0, 32) : [];
+  return {
+    ...baseline,
+    source: 'LLM two-step decomposition + deterministic connectivity evidence',
+    llm: { model: result.model, generationId: result.generationId },
+    functionalRoles: functionalRoles.length ? functionalRoles : baseline.functionalRoles,
+    substructures: substructures.length ? substructures : baseline.substructures,
+    summary: compactText(String(result.output.summary || ''), '', 800)
+  };
+}
+
+async function runOpenRouterRoleSizer(spec, template, hierarchy, knowledge, sizing, task) {
+  const result = await callOpenRouterAgent({
+    name: 'Role Sizer: ' + task.role,
+    system: 'You are one role-specific AgenticSizing Sizer. Change only bounded scalar scales for your assigned role. Report a recovery action; do not alter topology or other roles.',
+    prompt: `Assigned role: ${task.role}\nRecovery priority: ${task.priority}\nViolated constraints: ${task.constraints.join(', ')}\nCircuit: ${template.label}\nHierarchy: ${JSON.stringify(hierarchy)}\nCurrent metrics: ${JSON.stringify(sizing.metrics)}\nCurrent constraints: ${JSON.stringify(sizing.constraints)}\nReusable PDK-scoped knowledge: ${JSON.stringify(knowledge.sizingKnowledge.records)}\nReturn JSON {"targetRole":"${task.role}","deviceScale":0.8-1.25,"compensationScale":0.8-1.3,"rationale":"string","heuristic":"string"}.`,
+    schema: 'role-sizer-v1',
+    temperature: 0.05
+  });
+  return {
+    ...result,
+    task,
+    action: sanitizePlannerAction({ ...result.output, targetRole: task.role }, template),
+    rationale: compactText(String(result.output.rationale || ''), '', 600),
+    heuristic: compactText(String(result.output.heuristic || ''), '', 600)
+  };
+}
+
+function constrainedDelegation(template, constraints) {
+  const failed = [...new Set(constraints.filter((item) => !item.passed).map((item) => item.id))];
+  const owner = (constraint) => {
+    if (['gain', 'ugbw', 'noise'].includes(constraint)) return template.roles.some(([role]) => role === 'gain_stage') ? 'gain_stage' : template.roles[0][0];
+    if (constraint === 'phase' || constraint === 'settling') return template.roles.some(([role]) => role === 'compensation') ? 'compensation' : template.roles[0][0];
+    if (['power', 'supply_current'].includes(constraint)) return template.roles.some(([role]) => role === 'bias') ? 'bias' : template.roles[0][0];
+    return template.roles[0][0];
+  };
+  const priorities = ['power', 'supply_current', 'phase', 'ugbw', 'gain', 'noise', 'settling'];
+  return [...new Set(failed.map(owner))].map((role) => ({
+    role,
+    constraints: failed.filter((constraint) => owner(constraint) === role),
+    priority: Math.min(...failed.filter((constraint) => owner(constraint) === role).map((constraint) => {
+      const index = priorities.indexOf(constraint);
+      return index < 0 ? priorities.length : index;
+    }))
+  })).sort((left, right) => left.priority - right.priority);
+}
+
+async function runOpenRouterArchitecture(spec, template, knowledge, pdkProfile, decomposition = null) {
   const catalog = Object.values(TEMPLATE_LIBRARY).map((entry) => ({ id: entry.id, label: entry.label, family: entry.family }));
   const dataSheetLock = inferredDataSheetCircuit(spec.dataSheet);
   const result = await callOpenRouterAgent({
     name: 'Architect',
     system: 'You are the Architect in an analog-circuit agent team. Use only GraphRAG evidence supplied by the server. Produce a functional decomposition and bounded topology hypotheses, never a SPICE netlist. Quantitative facts from other PDKs are invalid until re-characterized. Novelty is a research candidate only; deterministic gates control production export.',
-    prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nInstalled PDK profile: ${JSON.stringify({ id: pdkProfile.id, minChannelLengthUm: pdkProfile.minChannelLengthUm, nominalVoltages: pdkProfile.nominalVoltages, supportsOnChipInductorTopology: pdkProfile.supportsOnChipInductorTopology })}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\n${dataSheetLock ? `DATASHEET CLASSIFICATION LOCK: select ${dataSheetLock}; never substitute an OTA or unrelated circuit family.` : ''}\nArchitecture policy: ${spec.architectureMode} (reliability=canonical only, balanced=dual track, discovery=more research search).\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "functionalPartitions":["signal-path|bias-and-reference|stability-and-control"], "topologyHypotheses":["bounded grammar hint"], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
+    prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nExisting-netlist decomposition (analysis-only; never generate a replacement netlist): ${JSON.stringify(decomposition)}\nInstalled PDK profile: ${JSON.stringify({ id: pdkProfile.id, minChannelLengthUm: pdkProfile.minChannelLengthUm, nominalVoltages: pdkProfile.nominalVoltages, supportsOnChipInductorTopology: pdkProfile.supportsOnChipInductorTopology })}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\n${dataSheetLock ? `DATASHEET CLASSIFICATION LOCK: select ${dataSheetLock}; never substitute an OTA or unrelated circuit family.` : ''}\nArchitecture policy: ${spec.architectureMode} (reliability=canonical only, balanced=dual track, discovery=more research search).\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "functionalPartitions":["signal-path|bias-and-reference|stability-and-control"], "topologyHypotheses":["bounded grammar hint"], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
     schema: 'architecture-v1'
   });
   const selected = TEMPLATE_LIBRARY[dataSheetLock] || TEMPLATE_LIBRARY[result.output.circuit] || template;
@@ -1990,12 +2113,17 @@ export async function runDesignCycle(rawInput = {}) {
     };
   }
 
-  const initialKnowledge = retrieveKnowledge(spec, requestedTemplate, pdkProfile);
+  const initialKnowledge = await retrieveKnowledge(spec, requestedTemplate, pdkProfile);
   if (llmRequired() && !openRouterConfigured()) {
     throw new Error('LLM agent loop is required. Configure OPENROUTER_API_KEY and OPENROUTER_MODEL.');
   }
+  const netlistDecomposition = spec.netlist
+    ? (llmRequired()
+      ? await runOpenRouterNetlistDecomposer(spec, requestedTemplate)
+      : deterministicNetlistDecomposition(spec.netlist, requestedTemplate))
+    : null;
   const architecture = llmRequired()
-    ? await runOpenRouterArchitecture(spec, requestedTemplate, initialKnowledge, pdkProfile)
+    ? await runOpenRouterArchitecture(spec, requestedTemplate, initialKnowledge, pdkProfile, netlistDecomposition)
     : { name: 'Architect', output: { circuit: requestedTemplate.id, rationale: 'test-only deterministic bypass', dataSheetLock: lockedDataSheetCircuit }, selectedTemplate: requestedTemplate };
   const template = architecture.selectedTemplate;
   const effectiveSpec = { ...mergeExtractedSpec(spec, architecture.output.extractedSpec), circuit: template.id };
@@ -2006,18 +2134,38 @@ export async function runDesignCycle(rawInput = {}) {
     throw error;
   }
   const specificationLedger = buildSpecLedger(effectiveSpec, architecture.output.specificationLedger, spec.naturalRequest);
-  const knowledge = retrieveKnowledge(effectiveSpec, template, pdkProfile);
+  const knowledge = await retrieveKnowledge(effectiveSpec, template, pdkProfile);
   const topologyPolicy = buildTopologyPolicy(template, effectiveSpec);
-  const planningHierarchy = buildHierarchicalPlan(template, effectiveSpec, defaultSizingAction(template));
+  const planningHierarchy = buildHierarchicalPlan(template, effectiveSpec, defaultSizingAction(template), netlistDecomposition);
   const fallbackPlan = makePlannerFallback(template, effectiveSpec);
   const planner = llmRequired()
     ? await runOpenRouterPlanner(effectiveSpec, template, knowledge, architecture, planningHierarchy)
     : await optionalOpenAIPlanner(effectiveSpec, template, fallbackPlan);
-  const hierarchy = buildHierarchicalPlan(template, effectiveSpec, planner.action);
+  const hierarchy = buildHierarchicalPlan(template, effectiveSpec, planner.action, netlistDecomposition);
   const topologySearch = buildCandidates(template, effectiveSpec, cacheKey, planner.action, effectiveSpec.architectureMode, pdkProfile);
   const candidates = topologySearch.candidates;
   const selected = candidates.find((candidate) => candidate.status === 'selected') || candidates[0];
   let sizing = runAgenticSizingCycle(template, effectiveSpec, cacheKey, selected, planner.action, specificationLedger);
+  // 1 + N recovery: each failed constraint is delegated to its functional role.
+  // The coordinator accepts only a non-worsening deterministically scored action.
+  const delegatedSizing = [];
+  for (const task of constrainedDelegation(template, sizing.constraints).slice(0, 4)) {
+    const sizer = llmRequired()
+      ? await runOpenRouterRoleSizer(effectiveSpec, template, hierarchy, knowledge, sizing, task)
+      : {
+        name: 'Role Sizer: ' + task.role,
+        task,
+        action: sanitizePlannerAction({ ...planner.action, targetRole: task.role }, template),
+        rationale: 'Deterministic fallback role action.',
+        heuristic: ''
+      };
+    const candidate = runAgenticSizingCycle(template, effectiveSpec, cacheKey + ':sizer:' + task.role, selected, sizer.action, specificationLedger);
+    const before = violationScore(sizing.constraints);
+    const after = violationScore(candidate.constraints);
+    const accepted = after <= before;
+    delegatedSizing.push({ role: task.role, constraints: task.constraints, priority: task.priority, rationale: sizer.rationale, heuristic: sizer.heuristic, action: sizer.action, before, after, accepted });
+    if (accepted) sizing = candidate;
+  }
   const platformEligibility = assessPlatformEligibility(template, effectiveSpec, pdkProfile);
   if (!platformEligibility.compatible) {
     sizing.constraints.push({
@@ -2071,6 +2219,19 @@ export async function runDesignCycle(rawInput = {}) {
     simulationAdapter = { dialect: adapted.dialect, status: 'accepted', detail: adapted.adapter };
     simulation = await runNgspice(adapted.deck);
   }
+  const fourViewKnowledge = extractFourViewKnowledge({
+    id: randomUUID(), pdkId: pdkProfile.id, templateId: template.id,
+    action: sizing.action, metrics: sizing.metrics, constraints: sizing.constraints,
+    decomposition: netlistDecomposition,
+    transferableHint: delegatedSizing.map((entry) => entry.heuristic).find(Boolean) || planner.output?.knowledgeWrite
+  });
+  fourViewKnowledge.simulation = { mode: simulation.mode, diagnostics: simulation.diagnostics };
+  let knowledgePersistence;
+  try {
+    knowledgePersistence = await persistSizingKnowledge(fourViewKnowledge);
+  } catch (error) {
+    knowledgePersistence = { error: error instanceof Error ? error.message : 'Could not persist sizing knowledge.' };
+  }
   const baseResult = {
     id: randomUUID(),
     createdAt: new Date().toISOString(),
@@ -2101,7 +2262,7 @@ export async function runDesignCycle(rawInput = {}) {
     },
     dataSheet,
     planner,
-    agentLoop: { architecture, planner, critic, verifier, hierarchy, topologyPolicy, required: llmRequired(), provider: 'OpenRouter' },
+    agentLoop: { architecture, planner, critic, verifier, hierarchy, topologyPolicy, netlistDecomposition, delegatedSizing, required: llmRequired(), provider: 'OpenRouter' },
     topology: buildTopology(template),
     candidates,
     search: {
@@ -2131,6 +2292,7 @@ export async function runDesignCycle(rawInput = {}) {
     pdg,
     agents: makeAgentStages(template, effectiveSpec, sizing.constraints, knowledge),
     retrieval: knowledge,
+    learnedKnowledge: { retrieved: knowledge.sizingKnowledge, extracted: fourViewKnowledge.views, persistence: knowledgePersistence },
     sources: knowledge.items,
     netlist: exportedNetlist,
     testbench: exportedTestbench,

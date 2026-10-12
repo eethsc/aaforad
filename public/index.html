@@ -104,6 +104,12 @@
                 <small>입력하면 AI가 회로군과 모든 검증 사양을 추출합니다. 매핑할 수 없는 사양은 export를 차단합니다.</small>
               </label>
 
+              <label class="field">
+                <span>기존 SPICE 넷리스트 · 선택 입력</span>
+                <textarea name="netlist" rows="7" spellcheck="false" placeholder=".subckt my_amp vinp vinn vout vdd vss&#10;M1 ...&#10;M2 ...&#10;Cc vout n1 1p&#10;.ends my_amp"></textarea>
+                <small>LLM이 기능 역할 → 표준 하위구조의 두 단계로 분석합니다. 연결 근거와 허용된 역할만 사용하며, 이 입력을 실행하거나 수정하지 않습니다.</small>
+              </label>
+
               <label class="field datasheet-field" for="datasheet-input">
                 <span>데이터시트 첨부 · PDF, TXT, Markdown</span>
                 <input id="datasheet-input" type="file" accept="application/pdf,text/plain,text/markdown,.pdf,.txt,.md">

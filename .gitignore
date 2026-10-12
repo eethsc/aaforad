@@ -3,6 +3,7 @@
 node_modules/
 coverage/
 *.log
+data/agentic-sizing-knowledge.json
 
 # Local paper corpus; source citations remain in the Markdown report.
 *.pdf

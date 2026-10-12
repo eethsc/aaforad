@@ -261,8 +261,17 @@ function renderPipeline(result) {
     ? ' · 적용 action: ' + action.targetRole + ' / device ×' + action.deviceScale
       + ' / comp ×' + action.compensationScale
     : '';
+  const decomposition = result.agentLoop?.netlistDecomposition;
+  const delegated = result.agentLoop?.delegatedSizing || [];
+  const decompositionSuffix = decomposition
+    ? ' · 넷리스트 분해: ' + decomposition.elementCount + ' elements / '
+      + (decomposition.substructures || []).map((item) => item.name).join(', ')
+    : '';
+  const delegationSuffix = delegated.length
+    ? ' · 역할별 복구: ' + delegated.filter((item) => item.accepted).length + '/' + delegated.length + ' accepted'
+    : '';
   const plannerText = target('#planner-text');
-  if (plannerText) plannerText.textContent = result.planner.text + actionSuffix;
+  if (plannerText) plannerText.textContent = result.planner.text + actionSuffix + decompositionSuffix + delegationSuffix;
   const iterationPill = target('#iteration-pill');
   if (iterationPill) iterationPill.textContent = result.iterationHistory.length + ' optimization records';
 }
