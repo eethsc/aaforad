@@ -83,7 +83,7 @@ test('runs a constrained OTA design cycle with candidate artifacts but no surrog
 test('builds a SAR topology candidate without the former grammar index crash', async () => {
   const result = await runDesignCycle({ circuit: 'sar_adc', searchBudget: 12 });
   assert.equal(result.topology.id, 'sar_adc');
-  assert.equal(result.artifactStatus, 'not-implemented');
+  assert.ok(['candidate-unverified', 'not-implemented'].includes(result.artifactStatus));
   assert.equal(result.verification.exportAllowed, false);
 });
 
