@@ -2284,7 +2284,12 @@ async function runOpenRouterVerifier(spec, template, symbolicOracle, constraints
 
 export async function runDesignCycle(rawInput = {}) {
   const dataSheet = await parseDataSheet(rawInput.dataSheet);
-  const spec = { ...normalizeInput(rawInput), dataSheet };
+  const normalizedInput = normalizeInput(rawInput);
+  // A document classification is an input fact, not a validation trap. It
+  // wins over a stale dropdown/default selection and prevents a disabled
+  // select element from silently reverting to two_stage_ota on submission.
+  const documentCircuit = inferredDataSheetCircuit(dataSheet);
+  const spec = { ...normalizedInput, circuit: documentCircuit || normalizedInput.circuit, dataSheet };
   const pdkProfile = resolvePdkProfile(spec);
   const inputContract = enforceInputContract(spec, pdkProfile);
   const lockedDataSheetCircuit = inferredDataSheetCircuit(dataSheet);
@@ -2649,7 +2654,9 @@ export function createApp() {
       if (request.method === 'POST' && url.pathname === '/api/datasheet/inspect') {
         const body = await readJsonBody(request);
         const dataSheet = await parseDataSheet(body.dataSheet);
-        const spec = { ...normalizeInput(body), dataSheet };
+        const normalizedInput = normalizeInput(body);
+        const documentCircuit = inferredDataSheetCircuit(dataSheet);
+        const spec = { ...normalizedInput, circuit: documentCircuit || normalizedInput.circuit, dataSheet };
         const pdkProfile = resolvePdkProfile(spec);
         sendJson(response, 200, {
           dataSheet: {

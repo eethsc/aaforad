@@ -60,6 +60,10 @@ async function fileAsBase64(file) {
 async function formPayload() {
   const values = new FormData(form);
   const payload = Object.fromEntries(values.entries());
+  // Disabled form controls are omitted by FormData. A classified datasheet is
+  // authoritative, so always transmit its resolved family rather than letting
+  // the server fall back to the default two-stage OTA.
+  if (state.dataSheetContract?.lockedCircuit) payload.circuit = state.dataSheetContract.lockedCircuit;
   payload.sessionId = state.sessionId;
   delete payload.dataSheet;
   if (state.dataSheet) {
@@ -94,9 +98,11 @@ function applyDataSheetContract(contract) {
   const supply = target('[name="supply"]');
   if (contract.lockedCircuit) {
     circuit.value = contract.lockedCircuit;
-    circuit.disabled = true;
+    circuit.disabled = false;
+    circuit.dataset.documentClass = contract.lockedCircuit;
   } else {
     circuit.disabled = false;
+    delete circuit.dataset.documentClass;
   }
   if (contract.supplyRange?.minimum !== null) supply.min = String(contract.supplyRange.minimum);
   if (contract.supplyRange?.maximum !== null) supply.max = String(contract.supplyRange.maximum);

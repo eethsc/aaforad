@@ -150,9 +150,9 @@ test('rejects a recognized Class-D datasheet when the selected PDK is incompatib
   }), /topology requires an off-chip inductor/);
 });
 
-test('classifies a voltage-reference datasheet as bandgap rather than inheriting an amplifier', async () => {
+test('classifies a voltage-reference datasheet as bandgap even when a stale amplifier dropdown is sent', async () => {
   const result = await runDesignCycle({
-    circuit: 'auto',
+    circuit: 'two_stage_ota',
     dataSheet: {
       fileName: 'ref30e.txt',
       mimeType: 'text/plain',
