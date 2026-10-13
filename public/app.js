@@ -584,9 +584,12 @@ function renderAll(result) {
       const review = result.dataSheet.reviewCandidates?.length
         ? ' · ' + result.dataSheet.reviewCandidates.length + '개 문맥 검토 대기'
         : '';
+      const kg = result.dataSheet.knowledgeGraph
+        ? ' · KG ' + result.dataSheet.knowledgeGraph.nodes.length + ' nodes / ' + result.dataSheet.knowledgeGraph.edges.length + ' edges (' + (result.dataSheet.knowledgeGraph.enrichment?.mode || result.dataSheet.knowledgeGraph.mode || 'evidence') + ')'
+        : '';
       status.textContent = result.dataSheet.fileName + ' · ' + result.dataSheet.requirements.length
         + '개 사양 추출' + review + (result.dataSheet.classification?.circuit ? ' · 자동 분류: ' + (result.dataSheet.classification.evidence || result.dataSheet.classification.circuit) : '')
-        + ' · ' + result.dataSheet.parser + ' · hash ' + result.dataSheet.sha256;
+        + kg + ' · ' + result.dataSheet.parser + ' · hash ' + result.dataSheet.sha256;
       status.className = 'ready';
     }
   }

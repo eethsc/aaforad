@@ -134,7 +134,11 @@ test('ingests a TLV271 datasheet attachment into the PDG ledger', async () => {
   });
   assert.equal(result.dataSheet.parser, 'TI TLV271 deterministic profile');
   assert.equal(result.dataSheet.requirements.length, 12);
+  assert.ok(result.dataSheet.knowledgeGraph.nodes.length > 12);
+  assert.ok(result.dataSheet.knowledgeGraph.edges.length > 12);
+  assert.equal(result.dataSheet.knowledgeGraph.clustering.entityCountBefore >= result.dataSheet.knowledgeGraph.clustering.entityCountAfter, true);
   assert.equal(result.pdg.valid, true);
+  assert.equal(result.pdg.sourceKnowledgeGraph.nodes, result.dataSheet.knowledgeGraph.nodes.length);
   assert.ok(result.constraints.some((item) => item.id === 'datasheet_slew_rate_typ'));
   assert.equal(result.verification.exportAllowed, false);
 });

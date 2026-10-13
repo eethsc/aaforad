@@ -15,6 +15,7 @@ import { buildResearchGraph, queryResearchGraph } from './engine/graphrag.mjs';
 import { callOpenRouterAgent, openRouterConfigured } from './engine/openrouter.mjs';
 import { assertNgspiceDeck, pdkKnowledgeScope, pdkTemplateCompatibility, resolvePdkProfile } from './engine/pdk-profile.mjs';
 import { extractFourViewKnowledge, persistSizingKnowledge, retrieveSizingKnowledge } from './engine/agentic_knowledge.mjs';
+import { buildEvidenceKnowledgeGraph, enrichKnowledgeGraphWithLlm } from './engine/datasheet_kg.mjs';
 
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
@@ -907,6 +908,7 @@ async function parseDataSheet(input) {
   const reviewCandidates = Array.isArray(parsedRequirements) ? [] : parsedRequirements.reviewCandidates;
   const globalConditions = Array.isArray(parsedRequirements) ? [] : parsedRequirements.globalConditions;
   const classification = classifyDataSheetCircuit(text, fileName);
+  const knowledgeGraph = buildEvidenceKnowledgeGraph({ fileName, text, requirements, globalConditions, layout, classification });
   return {
     fileName,
     mimeType: compactText(input.mimeType, extension === '.pdf' ? 'application/pdf' : 'text/plain', 80),
@@ -920,6 +922,7 @@ async function parseDataSheet(input) {
     reviewCandidates,
     globalConditions,
     classification,
+    knowledgeGraph,
     parser: /tlv271/i.test(text)
       ? 'TI TLV271 deterministic profile'
       : /tpa311[68]d2/i.test(text)
@@ -1840,7 +1843,8 @@ function pdgAnalysisOrder(testType) {
   return ({ op: 0, dc_sweep: 1, ac: 2, noise: 3, transient: 4, fft: 5, temperature_sweep: 6, manual: 7 })[testType] ?? 8;
 }
 
-function makePdg(template, ledger = []) {
+function makePdg(template, ledger = [], documentGraph = null) {
+  const graphAssertions = new Map((documentGraph?.nodes || []).filter((node) => node.type === 'assertion' && node.requirementId).map((node) => [node.requirementId, node]));
   const nodes = [
     { id: 'power_up', kind: 'stimulus', dependsOn: [], ports: ['vdd', 'gnd'] },
     { id: 'topology_ready', kind: 'structural_ready', dependsOn: ['power_up'], ports: template.nodes.filter((node) => node.kind !== 'ground').map((node) => node.id) }
@@ -1917,13 +1921,15 @@ function makePdg(template, ledger = []) {
         ports: ['out']
       });
       for (const item of items) {
+        const graphAssertion = graphAssertions.get(item.id.replace(/^datasheet_/, ''));
         coverage.push({
           ledgerId: item.id,
           assertion: assertionGroupId,
           assertionMember: item.id,
           test: testId,
           context: contextId,
-          conditions: context.conditions
+          conditions: context.conditions,
+          documentGraphAssertion: graphAssertion ? { id: graphAssertion.id, evidence: graphAssertion.evidence || [] } : null
         });
       }
     }
@@ -1951,7 +1957,13 @@ function makePdg(template, ledger = []) {
       analyses: nodes.filter((node) => node.kind === 'analysis').length,
       assertionGroups: nodes.filter((node) => node.kind === 'assertion_group').length,
       assertions: ledger.length
-    }
+    },
+    sourceKnowledgeGraph: documentGraph ? {
+      mode: documentGraph.enrichment?.mode || documentGraph.mode || 'deterministic-evidence',
+      nodes: documentGraph.nodes?.length || 0,
+      edges: documentGraph.edges?.length || 0,
+      clustering: documentGraph.clustering || null
+    } : null
   };
 }
 
@@ -2283,7 +2295,20 @@ async function runOpenRouterVerifier(spec, template, symbolicOracle, constraints
 }
 
 export async function runDesignCycle(rawInput = {}) {
-  const dataSheet = await parseDataSheet(rawInput.dataSheet);
+  let dataSheet = await parseDataSheet(rawInput.dataSheet);
+  if (dataSheet?.knowledgeGraph && llmRequired()) {
+    try {
+      const knowledgeGraph = await enrichKnowledgeGraphWithLlm(dataSheet.knowledgeGraph, callOpenRouterAgent);
+      dataSheet = { ...dataSheet, knowledgeGraph };
+    } catch (error) {
+      // A failed semantic enrichment must not invent a graph nor discard the
+      // deterministic, evidence-grounded graph already built from the PDF.
+      dataSheet = {
+        ...dataSheet,
+        knowledgeGraph: { ...dataSheet.knowledgeGraph, enrichment: { mode: 'deterministic-evidence', error: compactText(error instanceof Error ? error.message : String(error), 'LLM graph enrichment failed', 240) } }
+      };
+    }
+  }
   const normalizedInput = normalizeInput(rawInput);
   // A document classification is an input fact, not a validation trap. It
   // wins over a stale dropdown/default selection and prevents a disabled
@@ -2400,7 +2425,7 @@ export async function runDesignCycle(rawInput = {}) {
     sizing.verified = false;
   }
   const symbolicOracle = await evaluateSymbolicOracle({ metrics: sizing.metrics, spec: effectiveSpec });
-  const pdg = makePdg(template, specificationLedger);
+  const pdg = makePdg(template, specificationLedger, dataSheet?.knowledgeGraph || null);
   const verifier = llmRequired()
     ? await runOpenRouterVerifier(effectiveSpec, template, symbolicOracle, sizing.constraints, pdg)
     : { name: 'Verifier', output: { llmVerdict: 'pass', riskSummary: 'test-only deterministic bypass', testIntent: [] } };
@@ -2669,7 +2694,13 @@ export function createApp() {
             extractedVisuals: dataSheet.extractedVisuals,
             requirements: dataSheet.requirements,
             reviewCandidates: dataSheet.reviewCandidates,
-            globalConditions: dataSheet.globalConditions
+            globalConditions: dataSheet.globalConditions,
+            knowledgeGraph: {
+              mode: dataSheet.knowledgeGraph?.enrichment?.mode || dataSheet.knowledgeGraph?.mode || 'deterministic-evidence',
+              nodes: dataSheet.knowledgeGraph?.nodes?.length || 0,
+              edges: dataSheet.knowledgeGraph?.edges?.length || 0,
+              clustering: dataSheet.knowledgeGraph?.clustering || null
+            }
           },
           contract: dataSheetContract(spec, pdkProfile)
         });
