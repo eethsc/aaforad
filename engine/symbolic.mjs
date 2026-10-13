@@ -27,6 +27,36 @@ function ensureLocalEnv() {
   }
 }
 
+function deterministicThresholdOracle({ metrics, spec, reason }) {
+  const checks = [
+    ['gain', 'gainTarget', (actual, target) => actual >= target],
+    ['ugbw', 'ugbwTarget', (actual, target) => actual >= target],
+    ['phase', 'phaseTarget', (actual, target) => actual >= target],
+    ['power', 'powerTarget', (actual, target) => actual <= target],
+    ['noise', 'noiseTarget', (actual, target) => actual <= target]
+  ].filter(([, target]) => spec[target] !== null && spec[target] !== undefined);
+  const passed = Object.fromEntries(checks.map(([metric, target, compare]) => [
+    metric,
+    Number.isFinite(Number(metrics[metric])) && compare(Number(metrics[metric]), Number(spec[target]))
+  ]));
+  return {
+    // A missing optional Python package must not turn an otherwise valid
+    // generated SPICE skeleton into null. This is deterministic threshold
+    // evaluation, not a claim that a SymPy proof or ngspice measurement ran.
+    available: true,
+    fallback: true,
+    engine: 'JavaScript deterministic threshold oracle (SymPy unavailable)',
+    reason,
+    passed,
+    allPassed: Object.values(passed).every(Boolean),
+    formulas: {
+      gain: '20*log10(gm*ro)',
+      ugbw: 'gm/(2*pi*Cc)',
+      power: 'VDD*IDD'
+    }
+  };
+}
+
 /** Execute the SymPy oracle in a separate process, keeping symbolic evaluation
  * deterministic and independent from any LLM response. */
 export function evaluateSymbolicOracle({ metrics, spec }) {
@@ -41,18 +71,18 @@ export function evaluateSymbolicOracle({ metrics, spec }) {
     processHandle.stderr.on('data', (chunk) => { stderr += chunk; });
     processHandle.on('error', (error) => {
       clearTimeout(timeout);
-      resolve({ available: false, error: error.message, passed: {}, allPassed: false });
+      resolve(deterministicThresholdOracle({ metrics, spec, reason: error.message }));
     });
     processHandle.on('close', (code) => {
       clearTimeout(timeout);
       if (code !== 0) {
-        resolve({ available: false, error: stderr.trim() || `oracle exited ${code}`, passed: {}, allPassed: false });
+        resolve(deterministicThresholdOracle({ metrics, spec, reason: stderr.trim() || `oracle exited ${code}` }));
         return;
       }
       try {
         resolve({ available: true, ...JSON.parse(stdout) });
       } catch {
-        resolve({ available: false, error: 'Oracle emitted invalid JSON', passed: {}, allPassed: false });
+        resolve(deterministicThresholdOracle({ metrics, spec, reason: 'SymPy oracle emitted invalid JSON' }));
       }
     });
     processHandle.stdin.end(JSON.stringify({ metrics, spec }));
