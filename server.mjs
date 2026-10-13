@@ -711,62 +711,75 @@ async function parseDataSheet(input) {
     }
 
     if (!extracted || !text.trim()) {
-      // Decompress FlateDecode streams from PDF binary using built-in Node zlib
+      // Safe native stream parser: inspects PDF object dictionaries for /FlateDecode,
+      // filters out binary XObjects (images/fonts), and strictly bounds decompression memory/CPU.
       try {
+        const MAX_TOTAL_DECOMPRESSED_BYTES = 8 * 1024 * 1024; // 8 MB total limit
+        const MAX_STREAM_DECOMPRESSED_BYTES = 1024 * 1024;    // 1 MB per stream
         const binaryString = bytes.toString('binary');
         let decompressedText = '';
-        const extractedLines = [];
-        const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-        let streamMatch;
-        let pageCount = 0;
-        while ((streamMatch = streamRegex.exec(binaryString)) !== null) {
-          const rawStream = Buffer.from(streamMatch[1], 'binary');
+        let totalDecompressedBytes = 0;
+
+        // Match PDF object definitions containing streams: obj << ... >> stream ... endstream
+        const objectRegex = /(\d+\s+\d+\s+obj[\s\S]*?<<[\s\S]*?>>\s*stream\r?\n)([\s\S]*?)\r?\nendstream/g;
+        let objMatch;
+        while ((objMatch = objectRegex.exec(binaryString)) !== null) {
+          if (totalDecompressedBytes >= MAX_TOTAL_DECOMPRESSED_BYTES) break;
+
+          const dictHeader = objMatch[1];
+          const rawStreamBytes = Buffer.from(objMatch[2], 'binary');
+
+          // Ignore non-FlateDecode streams or image/font XObjects
+          const isFlate = /\/Filter\s*(?:\[\s*\/FlateDecode|\/FlateDecode)/i.test(dictHeader);
+          const isImageOrFont = /\/Subtype\s*\/(?:Image|Form|Type1|TrueType|CIDFontType)/i.test(dictHeader);
+          if (!isFlate || isImageOrFont) continue;
+
           let decomp = null;
-          try { decomp = zlib.inflateSync(rawStream); } catch {}
-          if (!decomp) {
-            try { decomp = zlib.inflateRawSync(rawStream); } catch {}
+          try {
+            decomp = zlib.inflateSync(rawStreamBytes, { finishFlush: zlib.constants.Z_SYNC_FLUSH });
+          } catch {
+            try {
+              decomp = zlib.inflateRawSync(rawStreamBytes);
+            } catch {}
           }
-          if (decomp) {
-            const streamStr = decomp.toString('utf8');
-            // Decode PDF text operators: (string) Tj, [array] TJ, etc.
-            const textChunks = [];
-            const tokenRegex = /\(([^)]*)\)\s*T[jJ]|\[([^\]]*)\]\s*TJ/g;
-            let tokenMatch;
-            while ((tokenMatch = tokenRegex.exec(streamStr)) !== null) {
-              if (tokenMatch[1] !== undefined) {
-                textChunks.push(tokenMatch[1].replace(/\\([()\\])/g, '$1'));
-              } else if (tokenMatch[2] !== undefined) {
-                const arrayParts = tokenMatch[2].match(/\(([^)]*)\)/g) || [];
-                const joined = arrayParts.map((p) => p.slice(1, -1).replace(/\\([()\\])/g, '$1')).join('');
-                if (joined) textChunks.push(joined);
-              }
+          if (!decomp || decomp.length > MAX_STREAM_DECOMPRESSED_BYTES) continue;
+
+          totalDecompressedBytes += decomp.length;
+          const streamStr = decomp.toString('utf8');
+
+          // Decode text operands: (string) Tj, [array] TJ
+          const textChunks = [];
+          const tokenRegex = /\(([^)]*)\)\s*T[jJ]|\[([^\]]*)\]\s*TJ/g;
+          let tokenMatch;
+          while ((tokenMatch = tokenRegex.exec(streamStr)) !== null) {
+            if (tokenMatch[1] !== undefined) {
+              textChunks.push(tokenMatch[1].replace(/\\([()\\])/g, '$1'));
+            } else if (tokenMatch[2] !== undefined) {
+              const arrayParts = tokenMatch[2].match(/\(([^)]*)\)/g) || [];
+              const joined = arrayParts.map((p) => p.slice(1, -1).replace(/\\([()\\])/g, '$1')).join('');
+              if (joined) textChunks.push(joined);
             }
-            if (textChunks.length) {
-              pageCount += 1;
-              const pageText = textChunks.join(' ');
-              decompressedText += pageText + '\n';
-              // Detect table rows by splitting text chunks into probable columns
-              const candidateRows = pageText.split(/(?:\r?\n| {3,})/).map((s) => s.trim()).filter(Boolean);
-              for (const line of candidateRows) {
-                const cells = line.split(/\t|\s{2,}/).map((c) => c.trim()).filter(Boolean);
-                if (cells.length >= 3) {
-                  extractedLines.push(cells);
-                }
-              }
-            }
+          }
+
+          if (textChunks.length) {
+            decompressedText += textChunks.join(' ') + '\n';
           }
         }
+
         if (decompressedText.trim().length > 50) {
           text = decompressedText;
           extracted = true;
-          if (extractedLines.length >= 2 && !tables.length) {
-            tables = [{ page: 1, table: 1, rows: extractedLines }];
-          }
+          // IMPORTANT: Native PDF fallback does NOT guess tables from whitespace lines.
+          // PDF operators lose cell bounds & layout coordinates; guessing tables
+          // creates synthetic/hallucinated specs. Tables are left empty so that
+          // extractGenericDataSheetRequirements strictly relies on deterministic textual lines.
+          tables = [];
         } else {
           const rawTextTokens = binaryString.match(/[a-zA-Z0-9_.-]{2,}/g) || [];
           if (rawTextTokens.length > 50) {
             text = rawTextTokens.join(' ');
             extracted = true;
+            tables = [];
           }
         }
       } catch {
@@ -799,7 +812,7 @@ async function parseDataSheet(input) {
       ? 'TI TLV271 deterministic profile'
       : /tpa311[68]d2/i.test(text)
         ? 'TI TPA3116D2 Class-D amplifier profile'
-        : tables.length ? 'native stream table + universal measurement-plan extraction' : 'universal measurement-plan extraction'
+        : tables.length ? 'pdfplumber table extraction' : 'native FlateDecode stream extraction'
   };
 }
 
@@ -885,21 +898,44 @@ function dataSheetContract(spec, pdkProfile) {
   const minimum = supplyRules.find((item) => item.operator === '>=')?.value ?? null;
   const maximum = supplyRules.find((item) => item.operator === '<=')?.value ?? null;
   const blockers = [];
+  const warnings = [];
 
   if (pdkProfile.id === 'unconfigured-external-pdk') blockers.push('선택한 외부 PDK의 model file, device vocabulary, simulator adapter가 설정되지 않았습니다.');
   if (lockedCircuit && spec.circuit !== 'auto' && spec.circuit !== lockedCircuit) {
     blockers.push(`데이터시트는 ${TEMPLATE_LIBRARY[lockedCircuit].label} 회로군으로 분류되지만 ${spec.circuit}이 선택되었습니다.`);
   }
-  if (requestedTemplate) {
-    const requestedCompatibility = pdkTemplateCompatibility(pdkProfile, requestedTemplate, spec);
-    if (!requestedCompatibility.compatible) blockers.push(...requestedCompatibility.reasons);
+  if (spec.circuit !== 'auto') {
+    if (requestedTemplate) {
+      const requestedCompatibility = pdkTemplateCompatibility(pdkProfile, requestedTemplate, spec);
+      if (!requestedCompatibility.compatible) blockers.push(...requestedCompatibility.reasons);
+    }
+    if (template) {
+      const compatibility = pdkTemplateCompatibility(pdkProfile, template, spec);
+      if (!compatibility.compatible) blockers.push(...compatibility.reasons);
+    }
+    if (minimum !== null && spec.supply < minimum) blockers.push(`VDD ${spec.supply} V가 데이터시트 최소 ${minimum} V보다 낮습니다.`);
+    if (maximum !== null && spec.supply > maximum) blockers.push(`VDD ${spec.supply} V가 데이터시트 최대 ${maximum} V보다 높습니다.`);
+    if (minimum !== null && minimum > pdkProfile.maxValidatedVoltage) {
+      blockers.push(`데이터시트 최소 전압 ${minimum} V가 ${pdkProfile.label}의 검증 한계 ${pdkProfile.maxValidatedVoltage} V를 초과합니다.`);
+    }
+  } else {
+    if (template) {
+      const compatibility = pdkTemplateCompatibility(pdkProfile, template, spec);
+      if (!compatibility.compatible) warnings.push(...compatibility.reasons);
+    }
+    if (minimum !== null && spec.supply < minimum) warnings.push(`VDD ${spec.supply} V가 데이터시트 최소 ${minimum} V보다 낮습니다.`);
+    if (maximum !== null && spec.supply > maximum) warnings.push(`VDD ${spec.supply} V가 데이터시트 최대 ${maximum} V보다 높습니다.`);
+    if (minimum !== null && minimum > pdkProfile.maxValidatedVoltage) {
+      warnings.push(`데이터시트 최소 전압 ${minimum} V가 ${pdkProfile.label}의 검증 한계 ${pdkProfile.maxValidatedVoltage} V를 초과합니다.`);
+    }
   }
-  if (template) {
-    const compatibility = pdkTemplateCompatibility(pdkProfile, template, spec);
-    if (!compatibility.compatible) blockers.push(...compatibility.reasons);
+  if (maximum !== null && maximum > pdkProfile.maxValidatedVoltage) {
+    if (spec.circuit !== 'auto' && spec.supply > pdkProfile.maxValidatedVoltage) {
+      blockers.push(`VDD ${spec.supply} V가 ${pdkProfile.label}의 검증 한계 ${pdkProfile.maxValidatedVoltage} V를 초과합니다.`);
+    } else {
+      warnings.push(`데이터시트 정격 전압(최대 ${maximum} V)이 ${pdkProfile.label}의 검증 한계 ${pdkProfile.maxValidatedVoltage} V를 초과하므로 주의가 필요합니다.`);
+    }
   }
-  if (minimum !== null && spec.supply < minimum) blockers.push(`VDD ${spec.supply} V가 데이터시트 최소 ${minimum} V보다 낮습니다.`);
-  if (maximum !== null && spec.supply > maximum) blockers.push(`VDD ${spec.supply} V가 데이터시트 최대 ${maximum} V보다 높습니다.`);
 
   const unmapped = (spec.dataSheet?.requirements || []).filter((item) => item.unmapped);
   // An unknown PDF fragment is retained for review and blocks sign-off later,
@@ -907,15 +943,17 @@ function dataSheetContract(spec, pdkProfile) {
   // prevents the Architect from proposing a topology.
   if (unmapped.length) blockers.push(`데이터시트의 ${unmapped.length}개 명시 사양을 측정 계획으로 변환하지 못했습니다: ${[...new Set(unmapped.map((item) => item.metric))].join(', ')}.`);
   const uniqueBlockers = [...new Set(blockers)];
+  const uniqueWarnings = [...new Set(warnings)];
 
   return {
     valid: uniqueBlockers.length === 0,
     blockers: uniqueBlockers,
+    warnings: uniqueWarnings,
     lockedCircuit,
     lockedCircuitLabel: lockedCircuit ? TEMPLATE_LIBRARY[lockedCircuit].label : null,
     supplyRange: { minimum, maximum },
     unmappedMetrics: unmapped.map((item) => item.metric),
-    reviewRequired: Boolean(spec.dataSheet?.reviewCandidates?.length),
+    reviewRequired: Boolean(spec.dataSheet?.reviewCandidates?.length || uniqueWarnings.length),
     reviewCandidates: (spec.dataSheet?.reviewCandidates || []).slice(0, 5),
     pdk: { id: pdkProfile.id, label: pdkProfile.label }
   };
@@ -2193,7 +2231,7 @@ export async function runDesignCycle(rawInput = {}) {
   const template = architecture.selectedTemplate;
   const effectiveSpec = { ...mergeExtractedSpec(spec, architecture.output.extractedSpec), circuit: template.id };
   const architectureCompatibility = pdkTemplateCompatibility(pdkProfile, template, effectiveSpec);
-  if (!architectureCompatibility.compatible) {
+  if (!architectureCompatibility.compatible && spec.circuit !== 'auto') {
     const error = new Error('선택된 회로군은 현재 PDK에서 지원되지 않습니다. ' + architectureCompatibility.reasons.join(' '));
     error.statusCode = 422;
     throw error;

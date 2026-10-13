@@ -60,7 +60,12 @@ Signal-to-noise ratio SNR: 102 dB`
   }
 };
 
-const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+process.env.FUSION_REQUIRE_LLM = 'false';
+
+const CHROME_PATH = process.env.CHROME_PATH
+  || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const BASE_URL = process.env.BASE_URL
+  || ('http://localhost:' + (process.env.PORT || '4173'));
 
 async function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -69,6 +74,7 @@ async function wait(ms) {
 async function runComprehensiveBrowserTests() {
   console.log('====================================================');
   console.log('Starting End-to-End Browser Testing for FUSION Studio');
+  console.log('Target URL:', BASE_URL);
   console.log('====================================================');
 
   const browser = await puppeteer.launch({
@@ -91,8 +97,8 @@ async function runComprehensiveBrowserTests() {
     }
   });
 
-  console.log('Opening http://localhost:4173...');
-  await page.goto('http://localhost:4173', { waitUntil: 'networkidle0' });
+  console.log(`Opening ${BASE_URL}...`);
+  await page.goto(BASE_URL, { waitUntil: 'networkidle0' });
 
   const testResults = [];
 
@@ -212,8 +218,10 @@ async function runComprehensiveBrowserTests() {
     console.log('\nTesting Case 4: OPA333 Commercial CMOS Op-Amp Datasheet...');
     const result = await testDataSheetUpload('opa333');
     
-    // OPA333 is 1.8V to 5.5V, perfectly compatible with Sky130 1.8V!
+    // OPA333 operating voltage is 1.8V to 5.5V. While 1.8V is compatible with Sky130 1.8V,
+    // the 5.5V ceiling exceeds Sky130's 3.3V validated boundary and flags contract review.
     const contractValid = !result.runBtnDisabled;
+    const hasVoltageWarningOrReview = result.statusText.includes('검토') || result.statusText.includes('계약');
     
     if (contractValid) {
       await page.click('#run-button');
@@ -226,19 +234,19 @@ async function runComprehensiveBrowserTests() {
       const verifyHeading = await page.$eval('#verification-status', (el) => el.textContent);
       
       recordResult(
-        'TC4: OPA333 Commercial Op-Amp (Compatible)',
-        true,
+        'TC4: OPA333 Commercial Op-Amp (Compatible with 5.5V Warning/Review)',
+        hasVoltageWarningOrReview,
         `Status="${result.statusText}", Topo="${topo}", VerifierStatus="${verifyHeading}"`
       );
     } else {
       recordResult(
-        'TC4: OPA333 Commercial Op-Amp (Compatible)',
+        'TC4: OPA333 Commercial Op-Amp (Compatible with 5.5V Warning/Review)',
         false,
         `Unexpectedly blocked: ${result.statusText}`
       );
     }
   } catch (err) {
-    recordResult('TC4: OPA333 Commercial Op-Amp (Compatible)', false, err.message);
+    recordResult('TC4: OPA333 Commercial Op-Amp (Compatible with 5.5V Warning/Review)', false, err.message);
   }
 
   // ----------------------------------------------------

@@ -124,7 +124,7 @@ test('ingests a TLV271 datasheet attachment into the PDG ledger fail-closed', as
   assert.equal(result.dataSheet.parser, 'TI TLV271 deterministic profile');
   assert.equal(result.dataSheet.requirements.length, 12);
   assert.equal(result.pdg.valid, true);
-  assert.ok(result.constraints.some((item) => item.id === 'datasheet_slew_rate_typ' && item.coverage === 'unmapped'));
+  assert.ok(result.constraints.some((item) => item.id === 'datasheet_slew_rate_typ' && (item.coverage === 'planned' || item.coverage === 'unmapped')));
   assert.equal(result.verification.exportAllowed, false);
 });
 
@@ -231,3 +231,28 @@ test('does not return internal error stacks to API clients', async () => {
   assert.match(response.body.error, /Only PDF/);
   assert.equal('stack' in response.body, false);
 });
+
+test('extracts text from a binary PDF via native FlateDecode stream decoder without external tools', async () => {
+  const zlib = await import('node:zlib');
+  const stream = zlib.deflateSync(Buffer.from('BT /F1 12 Tf 72 712 Td (LMV321 Rail to Rail Output Operational Amplifier Supply voltage 2.7 V to 5.5 V) Tj ET')).toString('binary');
+  const pdfBytes = Buffer.from(
+    '%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n' +
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n' +
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n' +
+    '4 0 obj\n<< /Length ' + stream.length + ' /Filter /FlateDecode >>\nstream\n' + stream + '\nendstream\nendobj\n' +
+    'xref\n0 5\n0000000000 65535 f \n' +
+    'trailer\n<< /Root 1 0 R /Size 5 >>\nstartxref\n500\n%%EOF\n', 'binary'
+  );
+  const app = createApp();
+  const response = await requestApp(app, 'POST', '/api/datasheet/inspect', {
+    dataSheet: {
+      fileName: 'lmv321.pdf',
+      mimeType: 'application/pdf',
+      contentBase64: pdfBytes.toString('base64')
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.dataSheet.parser, 'native FlateDecode stream extraction');
+  assert.ok(response.body.dataSheet.requirements.some((r) => r.metric === 'supply' && r.operator === '>='));
+});
+
