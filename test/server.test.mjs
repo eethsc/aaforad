@@ -6,6 +6,7 @@ import { createApp, normalizeInput, runDesignCycle } from '../server.mjs';
 // Unit tests deliberately bypass paid network agents; production defaults to
 // FUSION_REQUIRE_LLM=true and refuses a deterministic design-only run.
 process.env.FUSION_REQUIRE_LLM = 'false';
+process.env.FUSION_SKIP_PHYSICAL_SIMULATION = 'true';
 
 function requestApp(app, method, url, body) {
   return new Promise((resolve) => {
@@ -45,7 +46,7 @@ test('normalizes unsafe or out-of-range design inputs', () => {
   assert.equal(input.prompt, 'hello world');
 });
 
-test('runs a constrained OTA design cycle with verifiable artifacts', async () => {
+test('runs a constrained OTA design cycle with candidate artifacts but no surrogate sign-off', async () => {
   const result = await runDesignCycle({
     circuit: 'two_stage_ota',
     gainTarget: 62,
@@ -62,7 +63,9 @@ test('runs a constrained OTA design cycle with verifiable artifacts', async () =
   assert.match(result.netlist, /\.title 2-stage OTA/);
   assert.match(result.testbench, /\.ac dec/);
   assert.equal(result.verification.templateConstrained, true);
-  assert.equal(result.verification.exportAllowed, true);
+  assert.equal(result.verification.exportAllowed, false);
+  assert.equal(result.artifactStatus, 'candidate-unverified');
+  assert.equal(result.circuitAdapter.signoffCapable, false);
   assert.equal(result.retrieval.mode, 'local GraphRAG (evidence graph traversal)');
   assert.ok(result.retrieval.graph.graphStats.nodes > 0);
   assert.equal(result.sources.length, 5);
@@ -75,6 +78,13 @@ test('runs a constrained OTA design cycle with verifiable artifacts', async () =
   assert.equal(result.agentLoop.hierarchy.strategy, '1+N coordinator/local-sizer decomposition');
   assert.equal(result.verification.topologyPolicy.productionTrack, 'template-constrained composition');
   assert.ok(result.candidates.some((candidate) => candidate.track === 'research'));
+});
+
+test('builds a SAR topology candidate without the former grammar index crash', async () => {
+  const result = await runDesignCycle({ circuit: 'sar_adc', searchBudget: 12 });
+  assert.equal(result.topology.id, 'sar_adc');
+  assert.equal(result.artifactStatus, 'not-implemented');
+  assert.equal(result.verification.exportAllowed, false);
 });
 
 test('reliability mode disables exploratory topology candidates but retains hierarchical deterministic gates', async () => {
@@ -202,7 +212,8 @@ test('serves the health endpoint and the agent endpoint', async () => {
   const payload = design.body;
   assert.equal(design.statusCode, 200);
   assert.equal(payload.topology.id, 'ldo');
-  assert.match(payload.netlist, /MPASS/);
+  assert.match(payload.netlist, /XPASS/);
+  assert.equal(payload.verification.exportAllowed, false);
 });
 
 test('creates server-issued sessions and keeps result payloads out of the session list', async () => {

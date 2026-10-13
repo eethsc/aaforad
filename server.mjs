@@ -1253,7 +1253,9 @@ function topologyGrammar(template, explorationBias) {
         { id: 'cmp:doubletail', label: 'double-tail comparator', prior: 0.22 - explorationBias },
         { id: 'dac:binary', label: 'binary CDAC', prior: 0.997 }
       ];
-  const stages = (template.id === 'ldo' || template.id === 'class_d_audio_amp' || template.netlistKind === 'generic') ? [[choices[0]], [choices[1], choices[2]], [choices[3]]]
+  // SAR has three decision stages.  It previously fell into the five-token
+  // OTA path and dereferenced choices[4], crashing before a candidate existed.
+  const stages = (template.id === 'ldo' || template.id === 'class_d_audio_amp' || template.netlistKind === 'generic' || template.id === 'sar_adc') ? [[choices[0]], [choices[1], choices[2]], [choices[3]]]
     : [[choices[0]], [choices[1], choices[2]], [choices[3], choices[4]]];
   return stages.map((stage) => stage.map((entry) => ({ ...entry, prior: clamp(entry.prior, 0.001, 0.999) })));
 }
@@ -1714,7 +1716,27 @@ function runAgenticSizingCycle(template, spec, seed, selectedCandidate, plannerA
   };
 }
 
+function circuitAdapterStatus(template) {
+  const candidateDecks = new Set(['two_stage_ota', 'ldo']);
+  if (candidateDecks.has(template.id)) {
+    return {
+      level: 'candidate-deck',
+      canGenerate: true,
+      signoffCapable: false,
+      reason: 'A circuit-specific candidate deck exists, but its measurement adapter is not yet calibrated against SKY130 simulation.'
+    };
+  }
+  return {
+    level: 'not-implemented',
+    canGenerate: false,
+    signoffCapable: false,
+    reason: `${template.label} has no circuit-specific SKY130 netlist and measurement adapter yet. Generic behavioral placeholder decks are intentionally disabled.`
+  };
+}
+
 function makeNetlist(template, spec, variables, pdkProfile) {
+  const adapterStatus = circuitAdapterStatus(template);
+  if (!adapterStatus.canGenerate) return null;
   const byName = Object.fromEntries(variables.map((item) => [item.name, item.value]));
   const pdkModelFile = process.env.PDK_MODEL_FILE || pdkProfile.modelFile || '<PDK_MODEL_FILE>';
   const pdkCorner = process.env.PDK_CORNER || pdkProfile.corner;
@@ -1728,43 +1750,25 @@ function makeNetlist(template, spec, variables, pdkProfile) {
   ];
 
   let body;
-  if (template.netlistKind === 'generic') {
+  if (template.id === 'ldo') {
     body = [
-      '* Template-constrained structural deck; replace behavioral blocks with PDK subcircuits before sign-off.',
-      'VIN in 0 DC ' + round(spec.supply * 0.45, 3),
-      'RIN in n1 10k',
-      'GCORE n2 0 n1 0 1m',
-      'RF n2 out 20k',
-      'CSTAB out 0 1p',
-      'RLOAD out 0 100k'
-    ];
-  } else if (template.id === 'ldo') {
-    body = [
+      'VIN vin 0 DC {VDD}',
       'VREF vref 0 DC 0.6',
-      'MERR ea vref fb 0 ' + pdkProfile.deviceModels.nmos + ' W=8u L=0.36u',
-      'MPASS vout ea vin vin ' + pdkProfile.deviceModels.pmos + ' W=' + byName['W(MPASS)'] + 'u L=' + byName['L(MPASS)'] + 'u',
+      'XERR ea vref fb 0 ' + pdkProfile.deviceModels.nmos + ' W=8u L=0.36u',
+      'XPASS vout ea vin vin ' + pdkProfile.deviceModels.pmos + ' W=' + byName['W(MPASS)'] + 'u L=' + byName['L(MPASS)'] + 'u',
       'RFB1 vout fb 900k',
       'RFB2 fb 0 300k',
       'CC ea 0 ' + byName.Cc + 'p',
       'CLOAD vout 0 20p'
     ];
-  } else if (template.id === 'sar_adc') {
-    body = [
-      'VREFP vref 0 DC ' + byName.Vref,
-      'MSW sample vin clk 0 ' + pdkProfile.deviceModels.nmos + ' W=' + byName['W(MSW)'] + 'u L=0.18u',
-      'C0 dac sample ' + byName.Cunit + 'f',
-      'C1 dac sample ' + (byName.Cunit * 2) + 'f',
-      'XCOMP dac vref dout vdd 0 strongarm_latch W=' + byName['W(MCOMP)'] + 'u',
-      'XSAR dout b7 b6 b5 b4 b3 b2 b1 b0 sar_logic'
-    ];
   } else {
     body = [
-      'M1 n1 vinp tail 0 ' + pdkProfile.deviceModels.nmos + ' W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
-      'M2 n2 vinn tail 0 ' + pdkProfile.deviceModels.nmos + ' W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
-      'M3 n1 n1 vdd vdd ' + pdkProfile.deviceModels.pmos + ' W=12u L=0.36u',
-      'M4 n2 n1 vdd vdd ' + pdkProfile.deviceModels.pmos + ' W=12u L=0.36u',
-      'M5 tail vbias 0 0 ' + pdkProfile.deviceModels.nmos + ' W=5u L=0.72u',
-      'M6 vout n2 vdd vdd ' + pdkProfile.deviceModels.pmos + ' W=' + byName['W(M6)'] + 'u L=0.36u',
+      'X1 n1 vinp tail 0 ' + pdkProfile.deviceModels.nmos + ' W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
+      'X2 n2 vinn tail 0 ' + pdkProfile.deviceModels.nmos + ' W=' + byName['W(M1, M2)'] + 'u L=' + byName['L(M1, M2)'] + 'u',
+      'X3 n1 n1 vdd vdd ' + pdkProfile.deviceModels.pmos + ' W=12u L=0.36u',
+      'X4 n2 n1 vdd vdd ' + pdkProfile.deviceModels.pmos + ' W=12u L=0.36u',
+      'X5 tail vbias 0 0 ' + pdkProfile.deviceModels.nmos + ' W=5u L=0.72u',
+      'X6 vout n2 vdd vdd ' + pdkProfile.deviceModels.pmos + ' W=' + byName['W(M6)'] + 'u L=0.36u',
       'CC vout n1 ' + byName.Cc + 'p',
       'RZ vout n1 ' + byName.Rz,
       'IBIAS vbias 0 DC ' + byName.Ibias + 'u'
@@ -2395,29 +2399,43 @@ export async function runDesignCycle(rawInput = {}) {
   const verifier = llmRequired()
     ? await runOpenRouterVerifier(effectiveSpec, template, symbolicOracle, sizing.constraints, pdg)
     : { name: 'Verifier', output: { llmVerdict: 'pass', riskSummary: 'test-only deterministic bypass', testIntent: [] } };
-  const exportsAllowed = sizing.verified && platformEligibility.compatible && symbolicOracle.available && symbolicOracle.allPassed;
+  const adapterStatus = circuitAdapterStatus(template);
   // Keep a generated candidate visible even when strict sign-off fails.  The
   // old gate erased the only tangible output and made it look as though the
   // agent had not designed anything.  Download/export remains strict; this is
   // an inspect-only artefact until every assertion is discharged.
-  const candidateAllowed = platformEligibility.compatible;
+  const candidateAllowed = platformEligibility.compatible && adapterStatus.canGenerate;
   const candidateNetlist = candidateAllowed ? makeNetlist(template, effectiveSpec, sizing.variables, pdkProfile) : null;
-  const exportedNetlist = exportsAllowed ? candidateNetlist : null;
   const measurementPlan = buildMeasurementPlan(specificationLedger);
   const candidateTestbench = candidateAllowed ? makeTestbench(template, effectiveSpec, pdkProfile, specificationLedger) : null;
-  const exportedTestbench = exportsAllowed ? candidateTestbench : null;
   const ngspice = await detectNgspice();
   const pdk = await detectPdk();
   let simulation = ngspice.available && pdk.available
-    ? { mode: 'not-run', status: ngspice, pdk, metrics: null, diagnostics: 'ngspice and PDK are ready; simulation is withheld until all requirements pass the export gate' }
+    ? { mode: 'not-run', status: ngspice, pdk, metrics: null, diagnostics: 'ngspice and PDK are ready; no circuit-specific candidate deck is available for this template' }
     : { mode: 'analytic-surrogate', status: ngspice, pdk, metrics: null, diagnostics: 'ngspice or PDK unavailable; analytic model used for optimization only' };
   let simulationAdapter = { dialect: pdkProfile.dialect, status: 'not-run', detail: 'No exported deck' };
-  if (ngspice.available && pdk.available && exportedNetlist && exportedTestbench) {
-    const deck = exportedNetlist.replace(/\n\.end\s*$/i, '\n' + exportedTestbench + '\n.end');
+  if (ngspice.available && pdk.available && candidateNetlist && candidateTestbench && process.env.FUSION_SKIP_PHYSICAL_SIMULATION !== 'true') {
+    const deck = candidateNetlist.replace(/\n\.end\s*$/i, '\n' + candidateTestbench + '\n.end');
     const adapted = assertNgspiceDeck(deck, pdkProfile);
     simulationAdapter = { dialect: adapted.dialect, status: 'accepted', detail: adapted.adapter };
     simulation = await runNgspice(adapted.deck);
+  } else if (process.env.FUSION_SKIP_PHYSICAL_SIMULATION === 'true' && ngspice.available && pdk.available) {
+    simulation.diagnostics = 'physical simulation skipped by explicit test-only FUSION_SKIP_PHYSICAL_SIMULATION flag';
   }
+  // Surrogate estimates guide search only. A delivery is allowed only after a
+  // family-specific adapter has produced successful physical measurements.
+  // This intentionally makes every current prototype non-exportable until its
+  // adapter is implemented and calibrated; it prevents a generic placeholder
+  // or a failed ngspice run from receiving a green sign-off badge.
+  const physicalSimulationPassed = simulation.mode === 'ngspice' && Boolean(simulation.metrics);
+  const exportsAllowed = adapterStatus.signoffCapable
+    && sizing.verified
+    && platformEligibility.compatible
+    && symbolicOracle.available
+    && symbolicOracle.allPassed
+    && physicalSimulationPassed;
+  const exportedNetlist = exportsAllowed ? candidateNetlist : null;
+  const exportedTestbench = exportsAllowed ? candidateTestbench : null;
   const fourViewKnowledge = extractFourViewKnowledge({
     id: randomUUID(), pdkId: pdkProfile.id, templateId: template.id,
     action: sizing.action, metrics: sizing.metrics, constraints: sizing.constraints,
@@ -2485,6 +2503,7 @@ export async function runDesignCycle(rawInput = {}) {
       complete: specificationLedger.every((item) => !item.unmapped)
     },
     platformEligibility,
+    circuitAdapter: { ...adapterStatus, physicalSimulationPassed },
     iterationHistory: sizing.iterationHistory,
     optimization: sizing.optimization,
     roleKnowledge: sizing.roleKnowledge,
@@ -2495,7 +2514,7 @@ export async function runDesignCycle(rawInput = {}) {
     sources: knowledge.items,
     netlist: candidateNetlist,
     testbench: candidateTestbench,
-    artifactStatus: exportsAllowed ? 'verified-exportable' : candidateAllowed ? 'candidate-unverified' : 'withheld-pdk-mismatch',
+    artifactStatus: exportsAllowed ? 'verified-exportable' : candidateAllowed ? 'candidate-unverified' : adapterStatus.level === 'not-implemented' ? 'not-implemented' : 'withheld-pdk-mismatch',
     simulation,
     simulationAdapter,
     symbolicOracle,
@@ -2507,6 +2526,8 @@ export async function runDesignCycle(rawInput = {}) {
       exploratoryCandidatesBlockedFromExport: candidates.filter((candidate) => candidate.track === 'research').length,
       hierarchicalIntegration: hierarchy.integrationGate,
       numericalOracleEvaluated: symbolicOracle.available && symbolicOracle.allPassed,
+      physicalSimulationPassed,
+      circuitAdapter: adapterStatus,
       pdgValid: pdg.valid,
       allConstraintsPass: exportsAllowed,
       exportAllowed: exportsAllowed,

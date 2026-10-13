@@ -3,19 +3,30 @@ set -eu
 
 : "${PDK_ROOT:=/opt/pdks}"
 : "${PDK:=sky130A}"
-: "${SKY130_PDK_VERSION:=7519dfb04400f224f140749cda44ee7de6f5e095}"
+: "${SKY130_PDK_VERSION:=b344c97eacc2aaf8e14ae7e43e2e9dc0871de2c0}"
 : "${PDK_MODEL_FILE:=$PDK_ROOT/$PDK/libs.tech/ngspice/sky130.lib.spice}"
 export PDK_ROOT PDK SKY130_PDK_VERSION PDK_MODEL_FILE
 
-if [ ! -f "$PDK_MODEL_FILE" ]; then
-  echo "[fusion] Downloading pinned SKY130 PDK build $SKY130_PDK_VERSION to $PDK_ROOT ..."
-  # Volare uses PDK_ROOT and downloads the public, pre-built open_pdks artifact.
-  # The named Docker volume retains it, so this only happens once per machine/version.
-  volare enable --pdk sky130 "$SKY130_PDK_VERSION"
+model_root=$(dirname "$PDK_MODEL_FILE")
+pdk_complete() {
+  [ -f "$PDK_MODEL_FILE" ] \
+    && [ -f "$model_root/corners/tt.spice" ] \
+    && [ -f "$model_root/r+c/res_typical__cap_typical.spice" ] \
+    && [ -f "$model_root/r+c/res_typical__cap_typical__lin.spice" ] \
+    && [ -f "$model_root/corners/tt/specialized_cells.spice" ]
+}
+
+if ! pdk_complete; then
+  echo "[fusion] Installing/recovering complete SKY130 PDK build $SKY130_PDK_VERSION to $PDK_ROOT ..."
+  # Ciel distributes the complete open_pdks-generated ngspice hierarchy. The
+  # previous Volare artifact could expose the top-level library while omitting
+  # its corners/ and r+c/ includes, yielding a guaranteed ngspice failure.
+  # This operates only inside the named Docker PDK volume.
+  ciel enable --pdk-root "$PDK_ROOT" --pdk-family sky130 "$SKY130_PDK_VERSION"
 fi
 
-if [ ! -f "$PDK_MODEL_FILE" ]; then
-  echo "[fusion] SKY130 model file was not found after installation: $PDK_MODEL_FILE" >&2
+if ! pdk_complete; then
+  echo "[fusion] Complete SKY130 ngspice model set was not found after installation: $PDK_MODEL_FILE" >&2
   exit 70
 fi
 

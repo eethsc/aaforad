@@ -2,7 +2,7 @@ FROM node:22-bookworm-slim
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ngspice poppler-utils python3 python3-pip default-jre-headless ca-certificates \
-  && python3 -m pip install --no-cache-dir --break-system-packages volare sympy pdfplumber opendataloader-pdf \
+  && python3 -m pip install --no-cache-dir --break-system-packages volare ciel==2.1.3 truststore sympy pdfplumber opendataloader-pdf \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

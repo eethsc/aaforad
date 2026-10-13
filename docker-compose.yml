@@ -14,7 +14,7 @@ services:
       PDK_ROOT: /opt/pdks
       PDK: sky130A
       PDK_MODEL_FILE: /opt/pdks/sky130A/libs.tech/ngspice/sky130.lib.spice
-      SKY130_PDK_VERSION: "${SKY130_PDK_VERSION:-7519dfb04400f224f140749cda44ee7de6f5e095}"
+      SKY130_PDK_VERSION: "${SKY130_PDK_VERSION:-b344c97eacc2aaf8e14ae7e43e2e9dc0871de2c0}"
     volumes:
       - sky130-pdk:/opt/pdks
 

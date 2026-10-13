@@ -389,6 +389,10 @@ function artifactText() {
         + '아래는 LLM 에이전트가 생성한 검토용 SPICE 아티팩트입니다. 수치 검증·데이터시트 assertion이 모두 통과할 때까지 다운로드/제조 사용은 차단됩니다.\n\n'
         + candidate;
     }
+    if (state.result.circuitAdapter?.level === 'not-implemented') {
+      return 'CIRCUIT ADAPTER NOT IMPLEMENTED\n\n' + state.result.circuitAdapter.reason
+        + '\n\n이 회로군은 토폴로지 후보와 데이터시트 분석까지만 지원합니다. 가짜 behavioral SPICE deck을 출력하거나 검증 통과로 표시하지 않습니다.';
+    }
     return 'EXPORT BLOCKED\n\n미충족 제약: ' + (failed || 'unknown') + '\n'
       + '현재 PDK/회로 도메인에서는 후보 SPICE 아티팩트도 생성할 수 없습니다.';
   }
