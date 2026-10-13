@@ -108,7 +108,8 @@ export function verifyNetlistRules(netlistText, pdkProfile = {}) {
   const floatingNodes = [];
   const knownPortNames = new Set([
     'vin', 'vinp', 'vinn', 'vout', 'vref', 'fb', 'comp', 'clk', 'en', 'vdd', 'vss', '0',
-    'audio_in', 'spk_p', 'spk_n', 'in', 'out', 'in_p', 'in_n'
+    'audio_in', 'spk_p', 'spk_n', 'in', 'out', 'in_p', 'in_n',
+    'fref', 'vctrl', 'int_out', 'dout', 'fvco', 'fdiv', 'fb_dac'
   ]);
 
   for (const [node, count] of nodeConnections.entries()) {
@@ -128,6 +129,47 @@ export function verifyNetlistRules(netlistText, pdkProfile = {}) {
     elementCount,
     nodeCount: nodeConnections.size
   };
+}
+
+/**
+ * Normalizes circuit aliases into canonical synthesizer family keys
+ */
+export function canonicalCircuitId(id) {
+  if (!id || typeof id !== 'string') return 'two_stage_ota';
+  const clean = id.toLowerCase().trim();
+  const aliasMap = {
+    bandgap_reference: 'bandgap',
+    bandgap: 'bandgap',
+    dynamic_comparator: 'comparator',
+    comparator: 'comparator',
+    active_rc_filter: 'active_filter',
+    active_filter: 'active_filter',
+    tia: 'transimpedance_amp',
+    transimpedance_amp: 'transimpedance_amp',
+    telescopic_ota: 'telescopic_cascode_ota',
+    telescopic_cascode_ota: 'telescopic_cascode_ota',
+    common_source_amp: 'common_source_amp',
+    common_source: 'common_source_amp',
+    two_stage_ota: 'two_stage_ota',
+    folded_cascode_ota: 'folded_cascode_ota',
+    ldo: 'ldo',
+    sar_adc: 'sar_adc',
+    class_d_audio_amp: 'class_d_audio_amp',
+    class_d: 'class_d_audio_amp',
+    buck_converter: 'buck_converter',
+    buck: 'buck_converter',
+    charge_pump: 'charge_pump',
+    ring_oscillator: 'ring_oscillator',
+    current_mirror: 'current_mirror',
+    instrumentation_amp: 'instrumentation_amp',
+    lc_oscillator: 'lc_oscillator',
+    lc_tank_oscillator: 'lc_oscillator',
+    pll: 'pll',
+    phase_locked_loop: 'pll',
+    delta_sigma_adc: 'delta_sigma_adc',
+    sigma_delta_adc: 'delta_sigma_adc'
+  };
+  return aliasMap[clean] || clean;
 }
 
 /**
@@ -152,10 +194,12 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
   const rz = byName.Rz || 800;
   const ibias = byName.Ibias || 20;
 
+  const canonicalId = canonicalCircuitId(templateId);
+
   const header = [
     '* FUSION Analog Agent Studio - ATLAS Two-Winged Verified Deck',
-    `* Topology Family: ${templateId} | Target Process: ${spec.process || 'sky130A'}`,
-    `.title ${(templateId === 'two_stage_ota' ? '2-stage OTA' : templateId)} | ${spec.process || 'sky130A'}`,
+    `* Topology Family: ${canonicalId} (requested: ${templateId}) | Target Process: ${spec.process || 'sky130A'}`,
+    `.title ${(canonicalId === 'two_stage_ota' ? '2-stage OTA' : canonicalId)} | ${spec.process || 'sky130A'}`,
     `.param VDD=${vdd}`,
     `.lib ${pdkModelFile} ${pdkCorner}`,
     'VDD vdd 0 DC {VDD}'
@@ -167,7 +211,7 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
   const isAhuja = tokens.includes('ahuja');
   const isDoubleTail = tokens.includes('doubletail');
 
-  switch (templateId) {
+  switch (canonicalId) {
     case 'two_stage_ota':
       body = [
         `* 2-stage OTA (Input Pair, Active Load, Tail Bias, Second Stage, Compensation)`,
@@ -209,6 +253,7 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
       break;
 
     case 'telescopic_cascode_ota':
+    case 'telescopic_ota':
       body = [
         `* Telescopic Cascode High-Gain OTA`,
         `X1 nd1 vinp tail 0 ${nfet} W=${w_in}u L=${l_in}u`,
@@ -248,6 +293,7 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
       break;
 
     case 'bandgap':
+    case 'bandgap_reference':
       body = [
         `* Brokaw / Kuijk Bandgap Voltage Reference`,
         `Q1 0 n1_base q1_e 0 sky130_fd_pr__pnp_05v5`,
@@ -267,6 +313,7 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
       break;
 
     case 'comparator':
+    case 'dynamic_comparator':
       body = isDoubleTail
         ? [
           `* Double-Tail Dynamic Latched Comparator`,
@@ -319,6 +366,7 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
       break;
 
     case 'transimpedance_amp':
+    case 'tia':
       body = [
         `* Shunt-Feedback Optical Transimpedance Amplifier (TIA)`,
         `IIN in 0 DC 0 AC 1u`,
@@ -361,6 +409,7 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
       break;
 
     case 'active_filter':
+    case 'active_rc_filter':
       body = [
         `* Tow-Thomas 2nd-Order Biquad Active Filter`,
         `VIN in 0 AC 1`,
@@ -408,6 +457,7 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
       break;
 
     case 'class_d_audio_amp':
+    case 'class_d':
       body = [
         `* Bridge-Tied Load (BTL) Class-D Audio Amplifier Power Stage`,
         `VIN audio_in 0 AC 1`,
@@ -425,6 +475,7 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
       break;
 
     case 'buck_converter':
+    case 'buck':
       body = [
         `* Synchronous Step-Down Buck Converter Power Stage`,
         `VIN vin 0 DC {VDD}`,
@@ -475,6 +526,74 @@ export function buildParametricNetlist(templateId, spec = {}, variables = {}, pd
       ];
       break;
 
+    case 'common_source_amp':
+    case 'common_source':
+      body = [
+        `* Common-Source Amplifier with Active PMOS Current-Source Load`,
+        `VIN vin 0 DC 0.65 AC 1`,
+        `X1 out vin 0 0 ${nfet} W=${w_in}u L=${l_in}u`,
+        `XLOAD out vbias vdd vdd ${pfet} W=24u L=0.5u`,
+        `VBIAS vbias 0 DC 0.7`,
+        `CLOAD out 0 2p`,
+        `RLOAD out 0 100k`
+      ];
+      break;
+
+    case 'pll':
+    case 'phase_locked_loop':
+      body = [
+        `* Charge-Pump Phase-Locked Loop (PFD + CP + Loop Filter + VCO)`,
+        `VREF fref 0 PULSE(0 {VDD} 0 10p 10p 10n 20n)`,
+        `XPFD fref fdiv up dn vdd 0 pfd_cell`,
+        `XCP up dn vctrl vdd 0 cp_cell`,
+        `R_LF vctrl n_lf 10k`,
+        `C_LF n_lf 0 100p`,
+        `C_RIPPLE vctrl 0 10p`,
+        `XVCO vctrl fvco vdd 0 vco_cell`,
+        `XDIV fvco fdiv vdd 0 divider_cell`,
+        `.subckt pfd_cell ref fbk up dn vdd gnd`,
+        `E_UP up gnd ref gnd 1`,
+        `E_DN dn gnd fbk gnd 1`,
+        `.ends`,
+        `.subckt cp_cell up dn vctrl vdd gnd`,
+        `G_UP vdd vctrl up gnd 50u`,
+        `G_DN vctrl gnd dn gnd 50u`,
+        `.ends`,
+        `.subckt vco_cell vctrl out vdd gnd`,
+        `E_VCO out gnd vctrl gnd 10`,
+        `.ends`,
+        `.subckt divider_cell in out vdd gnd`,
+        `E_DIV out gnd in gnd 0.5`,
+        `.ends`
+      ];
+      break;
+
+    case 'delta_sigma_adc':
+    case 'sigma_delta_adc':
+      body = [
+        `* 1st-Order Switched-Capacitor Delta-Sigma Modulator`,
+        `VIN in 0 DC 0.9 AC 1`,
+        `VCLK1 clk1 0 PULSE(0 {VDD} 0 10p 10p 5n 10n)`,
+        `VCLK2 clk2 0 PULSE(0 {VDD} 5n 10p 10p 5n 10n)`,
+        `XINT in fb_dac int_out vdd 0 sc_integrator`,
+        `XCMP int_out 0 clk2 dout 0 strongarm_cell`,
+        `XDAC dout fb_dac vdd 0 1bit_dac`,
+        `CLOAD dout 0 50f`,
+        `.subckt sc_integrator in vdac out vdd gnd`,
+        `X1 n1 in clk1 gnd sky130_fd_pr__nfet_01v8 W=2u L=0.18u`,
+        `CS n1 gnd 1p`,
+        `CINT out in 4p`,
+        `E1 out gnd in gnd 1000`,
+        `.ends`,
+        `.subckt strongarm_cell inp inn clk out gnd`,
+        `E_CMP out gnd inp inn 500`,
+        `.ends`,
+        `.subckt 1bit_dac din vdac vdd gnd`,
+        `E_DAC vdac gnd din gnd 1`,
+        `.ends`
+      ];
+      break;
+
     default:
       // Robust Fallback: High-Quality 2-Stage Operational Transconductance Amplifier
       body = [
@@ -508,7 +627,7 @@ export function synthesizeNetlist({
   candidateTokens = [],
   llmNetlist = null
 }) {
-  const templateId = template.id || 'two_stage_ota';
+  const templateId = canonicalCircuitId(template.id || 'two_stage_ota');
 
   // Wing 1: If an LLM proposed a candidate netlist, verify it deterministically
   if (llmNetlist && typeof llmNetlist === 'string') {

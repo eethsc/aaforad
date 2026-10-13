@@ -17,7 +17,7 @@ import { assertNgspiceDeck, pdkKnowledgeScope, pdkTemplateCompatibility, resolve
 import { extractFourViewKnowledge, persistSizingKnowledge, retrieveSizingKnowledge } from './engine/agentic_knowledge.mjs';
 import { buildEvidenceKnowledgeGraph, enrichKnowledgeGraphWithLlm } from './engine/datasheet_kg.mjs';
 import { buildDatasheetGraph, queryDatasheetGraph } from './engine/datasheet_graph.mjs';
-import { synthesizeNetlist, verifyNetlistRules } from './engine/netlist_synthesizer.mjs';
+import { synthesizeNetlist, verifyNetlistRules, canonicalCircuitId } from './engine/netlist_synthesizer.mjs';
 
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
@@ -230,6 +230,185 @@ function classifyDataSheetCircuit(text, fileName = '') {
     if (match) return { circuit, confidence: 'high', evidence: match[0] };
   }
   return { circuit: null, confidence: 'unknown', evidence: null };
+}
+
+/**
+ * Cross-Family Circuit Intent Router (EXPLORE-style Natural Language & Spec Classifier)
+ * Resolves user requests across 16 circuit families without falling back to two_stage_ota.
+ */
+export function classifyCircuitIntent({ naturalRequest = '', prompt = '', spec = {}, dataSheet = null } = {}) {
+  // 1. Attached datasheet classification takes highest priority
+  const sheetCircuit = inferredDataSheetCircuit(dataSheet);
+  if (sheetCircuit) {
+    return {
+      primaryCircuit: sheetCircuit,
+      candidates: [sheetCircuit],
+      confidence: 'high',
+      source: 'datasheet_classification',
+      rationale: `데이터시트 자동 분석에 의해 ${sheetCircuit} 회로군으로 확정되었습니다.`
+    };
+  }
+
+  // 2. User explicit selection (when not 'auto')
+  if (spec.circuit && spec.circuit !== 'auto') {
+    const raw = spec.circuit;
+    const resolved = TEMPLATE_LIBRARY[raw] ? raw : (TEMPLATE_LIBRARY[canonicalCircuitId(raw)] ? canonicalCircuitId(raw) : null);
+    if (resolved) {
+      return {
+        primaryCircuit: resolved,
+        candidates: [resolved],
+        confidence: 'high',
+        source: 'user_explicit_selection',
+        rationale: `사용자 입력 선택에 의해 ${resolved} 회로군이 지정되었습니다.`
+      };
+    }
+  }
+
+  // 3. Natural-language intent mining across Korean and English circuit terms
+  const corpus = `${naturalRequest} ${prompt}`.toLowerCase();
+
+  const rules = [
+    {
+      id: 'ldo',
+      pattern: /\bldo\b|\blow[- ]dropout\b|linear\s+regulator|레귤레이터|전원\s*안정화|드롭아웃|드롭\s*아웃/i,
+      score: 10,
+      family: '전원 관리'
+    },
+    {
+      id: 'bandgap_reference',
+      pattern: /\bbandgap\b|voltage\s*reference|기준\s*전압|밴드갭|밴드\s*갭|\bvref\b/i,
+      score: 10,
+      family: '레퍼런스'
+    },
+    {
+      id: 'dynamic_comparator',
+      pattern: /\bcomparator\b|비교기|strongarm|double[- ]tail|래치|latch/i,
+      score: 10,
+      family: '데이터 컨버터'
+    },
+    {
+      id: 'active_rc_filter',
+      pattern: /\bfilter\b|필터|biquad|low[- ]pass|high[- ]pass|band[- ]pass|active[- ]rc/i,
+      score: 10,
+      family: '필터'
+    },
+    {
+      id: 'tia',
+      pattern: /\btia\b|transimpedance|트랜스임피던스|광센서|photodiode|current[- ]to[- ]voltage/i,
+      score: 10,
+      family: '센서 인터페이스'
+    },
+    {
+      id: 'sar_adc',
+      pattern: /\bsar\s*adc\b|\badc\b|아날로그[- ]디지털|cdac|quantiz/i,
+      score: 10,
+      family: '혼성신호'
+    },
+    {
+      id: 'class_d_audio_amp',
+      pattern: /class[- ]d|클래스[- ]d|오디오|스피커|speaker|audio|btl/i,
+      score: 10,
+      family: '전력 오디오'
+    },
+    {
+      id: 'buck_converter',
+      pattern: /\bbuck\b|강압|step[- ]down|dc[- ]dc|벅/i,
+      score: 10,
+      family: '전원 관리'
+    },
+    {
+      id: 'charge_pump',
+      pattern: /charge[- ]pump|차지\s*펌프|dickson|승압\s*커패시터/i,
+      score: 10,
+      family: '전원 관리'
+    },
+    {
+      id: 'ring_oscillator',
+      pattern: /ring\s*oscillator|링\s*발진기|발진기|vco|발진/i,
+      score: 10,
+      family: '클록'
+    },
+    {
+      id: 'pll',
+      pattern: /\bpll\b|phase[- ]locked\s*loop|위상\s*고정/i,
+      score: 10,
+      family: '클록'
+    },
+    {
+      id: 'delta_sigma_adc',
+      pattern: /delta[- ]sigma|sigma[- ]delta|델타[- ]시그마/i,
+      score: 10,
+      family: '혼성신호'
+    },
+    {
+      id: 'telescopic_ota',
+      pattern: /telescopic|텔레스코픽/i,
+      score: 9,
+      family: '증폭기'
+    },
+    {
+      id: 'folded_cascode_ota',
+      pattern: /folded\s*cascode|폴디드\s*캐스코드|폴디드/i,
+      score: 9,
+      family: '증폭기'
+    },
+    {
+      id: 'common_source_amp',
+      pattern: /common[- ]source|공통\s*소스|단일단\s*증폭기|cs\s*amp/i,
+      score: 8,
+      family: '증폭기'
+    },
+    {
+      id: 'two_stage_ota',
+      pattern: /two[- ]stage|2단|2[- ]stage|ota|op[- ]?amp|연산\s*증폭기|증폭기/i,
+      score: 5,
+      family: '증폭기'
+    }
+  ];
+
+  const matches = rules.filter((r) => r.pattern.test(corpus));
+  if (matches.length > 0) {
+    matches.sort((a, b) => b.score - a.score);
+    const primary = matches[0].id;
+    return {
+      primaryCircuit: primary,
+      candidates: matches.map((m) => m.id),
+      confidence: 'high',
+      source: 'natural_language_intent',
+      rationale: `자연어 요청에서 '${primary}' 회로군 의도가 명확히 감지되었습니다.`
+    };
+  }
+
+  // 4. Spec-driven heuristic routing
+  const gain = Number(spec.gainTarget) || 0;
+  const ugbw = Number(spec.ugbwTarget) || 0;
+  if (gain >= 80 && ugbw >= 200) {
+    return {
+      primaryCircuit: 'telescopic_ota',
+      candidates: ['telescopic_ota', 'folded_cascode_ota', 'two_stage_ota'],
+      confidence: 'medium',
+      source: 'spec_heuristics',
+      rationale: `초고이득(${gain} dB) 및 초고속(${ugbw} MHz) 요구사양에 따라 Telescopic OTA가 추천되었습니다.`
+    };
+  }
+  if (gain >= 70) {
+    return {
+      primaryCircuit: 'folded_cascode_ota',
+      candidates: ['folded_cascode_ota', 'two_stage_ota', 'telescopic_ota'],
+      confidence: 'medium',
+      source: 'spec_heuristics',
+      rationale: `고이득(${gain} dB) 및 출력 스윙 요구사양에 따라 Folded Cascode OTA가 추천되었습니다.`
+    };
+  }
+
+  // 5. Default generic analog fallback
+  return {
+    primaryCircuit: 'two_stage_ota',
+    candidates: ['two_stage_ota', 'folded_cascode_ota', 'telescopic_ota'],
+    confidence: 'low',
+    source: 'default_catalog',
+    rationale: '범용 다목적 아날로그 증폭기 사양으로 2-stage OTA가 기본 선택되었습니다.'
+  };
 }
 
 function assessPlatformEligibility(template, spec, pdkProfile) {
@@ -959,11 +1138,18 @@ function optionalNumber(value, min, max) {
 }
 
 export function normalizeInput(input = {}) {
-  const circuit = input.circuit === 'auto'
-    ? 'auto'
-    : Object.hasOwn(TEMPLATE_LIBRARY, input.circuit)
-    ? input.circuit
-    : DEFAULT_INPUT.circuit;
+  let circuit = input.circuit;
+  if (circuit === 'auto') {
+    circuit = 'auto';
+  } else if (circuit && Object.hasOwn(TEMPLATE_LIBRARY, circuit)) {
+    circuit = circuit;
+  } else if (circuit && TEMPLATE_LIBRARY[canonicalCircuitId(circuit)]) {
+    circuit = canonicalCircuitId(circuit);
+  } else if (input.naturalRequest && input.naturalRequest.trim()) {
+    circuit = 'auto';
+  } else {
+    circuit = DEFAULT_INPUT.circuit;
+  }
 
   return {
     circuit,
@@ -1368,6 +1554,30 @@ function buildCandidates(template, spec, seed, action = defaultSizingAction(temp
       tokens: result.state.tokens
     };
   });
+  if (spec.circuitIntent?.candidates?.length > 1 && architectureMode !== 'reliability') {
+    for (const altFamilyId of spec.circuitIntent.candidates) {
+      if (altFamilyId === template.id) continue;
+      const altTemplate = TEMPLATE_LIBRARY[altFamilyId] || TEMPLATE_LIBRARY[canonicalCircuitId(altFamilyId)];
+      if (!altTemplate) continue;
+      const altCompat = pdkTemplateCompatibility(pdkProfile, altTemplate, spec);
+      candidates.push({
+        id: 'candidate-alt-' + altFamilyId,
+        label: altTemplate.label + ' (Cross-Family Alternative)',
+        templateMatch: 'cross-family architecture candidate',
+        exportable: altCompat.compatible,
+        track: 'research',
+        promotionGate: altCompat.compatible
+          ? 'cross-family explored; active selection prioritized ' + template.label
+          : 'blocked by installed PDK profile: ' + altCompat.reasons.join('; '),
+        prior: 0.85,
+        feasibility: altCompat.compatible ? 0.88 : 0.45,
+        visits: 1,
+        puctScore: altCompat.compatible ? 0.86 : 0.45,
+        status: 'screened',
+        tokens: ['family:' + altFamilyId]
+      });
+    }
+  }
   if (architectureMode === 'reliability') candidates = candidates.filter((candidate) => candidate.exportable);
   candidates.sort((left, right) => (left.exportable === right.exportable ? right.puctScore - left.puctScore : left.exportable ? -1 : 1));
   return { candidates, searchResult };
@@ -1796,13 +2006,14 @@ function runAgenticSizingCycle(template, spec, seed, selectedCandidate, plannerA
 
 function circuitAdapterStatus(template) {
   const supportedFamilies = new Set([
-    'two_stage_ota', 'folded_cascode_ota', 'telescopic_cascode_ota', 'ldo', 'bandgap',
-    'comparator', 'charge_pump', 'transimpedance_amp', 'lc_oscillator', 'ring_oscillator',
-    'active_filter', 'sar_adc', 'class_d_audio_amp', 'buck_converter', 'current_mirror',
-    'instrumentation_amp'
+    'two_stage_ota', 'folded_cascode_ota', 'telescopic_cascode_ota', 'telescopic_ota', 'ldo', 'bandgap', 'bandgap_reference',
+    'comparator', 'dynamic_comparator', 'charge_pump', 'transimpedance_amp', 'tia', 'lc_oscillator', 'ring_oscillator',
+    'active_filter', 'active_rc_filter', 'sar_adc', 'class_d_audio_amp', 'class_d', 'buck_converter', 'buck', 'current_mirror',
+    'instrumentation_amp', 'common_source_amp', 'pll', 'delta_sigma_adc'
   ]);
 
-  if (supportedFamilies.has(template.id) || template.netlistKind === 'class_d') {
+  const canonical = canonicalCircuitId(template.id);
+  if (supportedFamilies.has(template.id) || supportedFamilies.has(canonical) || template.netlistKind === 'class_d') {
     return {
       level: 'candidate-deck',
       canGenerate: true,
@@ -2302,7 +2513,10 @@ async function runOpenRouterArchitecture(spec, template, knowledge, pdkProfile, 
     prompt: `Structured inputs: ${JSON.stringify(spec)}\nNatural-language design request: ${spec.naturalRequest || '(none)'}\nExisting-netlist decomposition (analysis-only; never generate a replacement netlist): ${JSON.stringify(decomposition)}\nInstalled PDK profile: ${JSON.stringify({ id: pdkProfile.id, minChannelLengthUm: pdkProfile.minChannelLengthUm, nominalVoltages: pdkProfile.nominalVoltages, supportsOnChipInductorTopology: pdkProfile.supportsOnChipInductorTopology })}\nCandidate circuit catalog: ${JSON.stringify(catalog)}\n${dataSheetLock ? `DATASHEET CLASSIFICATION LOCK: select ${dataSheetLock}; never substitute an OTA or unrelated circuit family.` : ''}\nArchitecture policy: ${spec.architectureMode} (reliability=canonical only, balanced=dual track, discovery=more research search).\nGraphRAG evidence: ${graphContext(knowledge)}\nExtract EVERY stated measurable requirement into specificationLedger; do not omit unrecognised specs. Return JSON {"circuit":"catalog id", "rationale":"string", "retrievalTerms":["..."], "topologyFocus":["..."], "functionalPartitions":["signal-path|bias-and-reference|stability-and-control"], "topologyHypotheses":["bounded grammar hint"], "extractedSpec":{"supply":number,"gainTarget":number,"ugbwTarget":number,"phaseTarget":number,"powerTarget":number,"noiseTarget":number,"process":"string"}, "specificationLedger":[{"metric":"string","operator":">=|<=","value":number,"unit":"string","testType":"ac|op|noise|transient|manual"}]}.`,
     schema: 'architecture-v1'
   });
-  const selected = TEMPLATE_LIBRARY[dataSheetLock] || TEMPLATE_LIBRARY[result.output.circuit] || template;
+  const candidateId = result.output.circuit
+    ? (TEMPLATE_LIBRARY[result.output.circuit] ? result.output.circuit : (TEMPLATE_LIBRARY[canonicalCircuitId(result.output.circuit)] ? canonicalCircuitId(result.output.circuit) : null))
+    : null;
+  const selected = TEMPLATE_LIBRARY[dataSheetLock] || TEMPLATE_LIBRARY[candidateId] || template;
   return { ...result, selectedTemplate: selected, output: { ...result.output, circuit: selected.id, dataSheetLock: dataSheetLock || null } };
 }
 
@@ -2367,13 +2581,26 @@ export async function runDesignCycle(rawInput = {}) {
   // wins over a stale dropdown/default selection and prevents a disabled
   // select element from silently reverting to two_stage_ota on submission.
   const documentCircuit = inferredDataSheetCircuit(dataSheet);
-  const spec = { ...normalizedInput, circuit: documentCircuit || normalizedInput.circuit, dataSheet };
+
+  // Intent classification across Natural Language, Spec constraints, and Datasheet:
+  const circuitIntent = classifyCircuitIntent({
+    naturalRequest: normalizedInput.naturalRequest,
+    prompt: normalizedInput.prompt,
+    spec: normalizedInput,
+    dataSheet
+  });
+
+  const targetCircuitId = documentCircuit
+    || (normalizedInput.circuit !== 'auto' ? normalizedInput.circuit : circuitIntent.primaryCircuit);
+
+  const requestedTemplate = TEMPLATE_LIBRARY[targetCircuitId]
+    || TEMPLATE_LIBRARY[canonicalCircuitId(targetCircuitId)]
+    || TEMPLATE_LIBRARY[DEFAULT_INPUT.circuit];
+
+  const spec = { ...normalizedInput, circuit: requestedTemplate.id, dataSheet, circuitIntent };
   const pdkProfile = resolvePdkProfile(spec);
   const inputContract = enforceInputContract(spec, pdkProfile);
   const lockedDataSheetCircuit = inferredDataSheetCircuit(dataSheet);
-  const requestedTemplate = TEMPLATE_LIBRARY[lockedDataSheetCircuit]
-    || TEMPLATE_LIBRARY[spec.circuit]
-    || TEMPLATE_LIBRARY[DEFAULT_INPUT.circuit];
   const planningIdentity = openRouterConfigured() ? 'openrouter:' + process.env.OPENROUTER_MODEL : 'llm-unconfigured';
   const cacheKey = createHash('sha256')
     .update(JSON.stringify({ spec, pdkProfile: pdkProfile.id, planningIdentity, engine: 'pdk-scoped-agent-loop-v4' }))
@@ -2403,7 +2630,7 @@ export async function runDesignCycle(rawInput = {}) {
     : null;
   const architecture = llmRequired()
     ? await runOpenRouterArchitecture(spec, requestedTemplate, initialKnowledge, pdkProfile, netlistDecomposition)
-    : { name: 'Architect', output: { circuit: requestedTemplate.id, rationale: 'test-only deterministic bypass', dataSheetLock: lockedDataSheetCircuit }, selectedTemplate: requestedTemplate };
+    : { name: 'Architect', output: { circuit: requestedTemplate.id, rationale: circuitIntent.rationale, dataSheetLock: lockedDataSheetCircuit }, selectedTemplate: requestedTemplate };
   const template = architecture.selectedTemplate;
   const effectiveSpec = { ...mergeExtractedSpec(spec, architecture.output.extractedSpec), circuit: template.id };
   const architectureCompatibility = pdkTemplateCompatibility(pdkProfile, template, effectiveSpec);
@@ -2535,6 +2762,8 @@ export async function runDesignCycle(rawInput = {}) {
   const baseResult = {
     id: randomUUID(),
     createdAt: new Date().toISOString(),
+    circuit: template.id,
+    template,
     mode: {
       simulator: simulation.mode === 'ngspice'
         ? 'ngspice measurement'
