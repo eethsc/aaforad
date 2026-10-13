@@ -19,6 +19,7 @@ const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const RESEARCH_NOTES_PATH = path.join(ROOT_DIR, 'analog_design_agentic_ai_papers.md');
 const PDF_TABLE_EXTRACTOR_PATH = path.join(ROOT_DIR, 'engine', 'datasheet_pdf_extract.py');
+const OPENDATALOADER_EXTRACTOR_PATH = path.join(ROOT_DIR, 'engine', 'opendataloader_extract.py');
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const MAX_DATASHEET_BYTES = 7 * 1024 * 1024;
 const responseCache = new Map();
@@ -529,7 +530,9 @@ function extractTableRequirements(tables, fileName) {
       if (!adapter) continue;
       const unit = tableUnit(row, unitIndex);
       const rowCondition = conditionIndex >= 0 ? row[conditionIndex] : '';
-      const source = `PDF table p.${table.page ?? '?'} r.${table.table ?? '?'}: ${row.filter(Boolean).join(' | ')}`;
+      const context = [table.heading, table.caption].filter(Boolean).join(' · ');
+      const bbox = Array.isArray(table.bbox) ? ` bbox=${table.bbox.join(',')}` : '';
+      const source = `PDF table p.${table.page ?? '?'} r.${table.table ?? '?'}${bbox}${context ? ` · ${context}` : ''}: ${row.filter(Boolean).join(' | ')}`;
       for (const [grade, index, operator] of [['min', minIndex, '>='], ['typ', typIndex, '~='], ['max', maxIndex, '<=']]) {
         const value = index >= 0 ? tableNumber(row[index]) : null;
         if (!Number.isFinite(value)) continue;
@@ -564,7 +567,7 @@ function dedupeRequirements(requirements) {
   });
 }
 
-function extractGenericDataSheetRequirements(text, fileName, tables = []) {
+function extractGenericDataSheetRequirements(text, fileName, tables = [], layout = {}) {
   const lines = text.split(/\r?\n/).map((line) => compactText(line, '', 360)).filter(Boolean);
   const requirements = extractSupplyRangeRequirements(lines, fileName).concat(extractTableRequirements(tables, fileName));
   const reviewCandidates = [];
@@ -597,17 +600,22 @@ function extractGenericDataSheetRequirements(text, fileName, tables = []) {
     ));
     requirements.push({ ...adapted, conditions: mergeTestConditions(globalConditions, adapted.conditions) });
   }
+  const visualReviewCandidates = (layout.visuals || [])
+    .filter((item) => /chart|figure|image|picture/i.test(item.type || ''))
+    .map((item) => [item.heading, item.description].filter(Boolean).join(' · '))
+    .filter((item) => isElectricalCandidate(item))
+    .slice(0, 12);
   return {
     requirements: dedupeRequirements(requirements.map((item) => ({
       ...item,
       conditions: mergeTestConditions(globalConditions, item.conditions || [])
     }))),
-    reviewCandidates,
+    reviewCandidates: [...new Set([...reviewCandidates, ...visualReviewCandidates])].slice(0, 24),
     globalConditions
   };
 }
 
-function extractDataSheetRequirements(text, fileName, tables = []) {
+function extractDataSheetRequirements(text, fileName, tables = [], layout = {}) {
   const normalized = text.replace(/\s+/g, ' ').toLowerCase();
   // A deterministic profile keeps original supplier requirements distinct from
   // user wishes. It is deliberately fail-closed for metrics without a local
@@ -643,7 +651,7 @@ function extractDataSheetRequirements(text, fileName, tables = []) {
       dataSheetRequirement('temperature_max', 'operating_temperature', '<=', 125, '°C', 'manual', 'TPA3116D2 datasheet: maximum junction/operating temperature', true)
     ];
   }
-  return extractGenericDataSheetRequirements(text, fileName, tables);
+  return extractGenericDataSheetRequirements(text, fileName, tables, layout);
 }
 
 function execFileText(command, args, options = {}) {
@@ -653,6 +661,17 @@ function execFileText(command, args, options = {}) {
       else resolve(stdout);
     });
   });
+}
+
+function linearizeLayoutBlocks(blocks, fallback) {
+  if (!Array.isArray(blocks) || !blocks.length) return fallback;
+  const lines = blocks.map((block) => {
+    const page = block.page ? `p.${block.page}` : 'p.?';
+    const bbox = Array.isArray(block.bbox) ? ` bbox=${block.bbox.join(',')}` : '';
+    const heading = block.heading ? ` · ${compactText(block.heading, '', 180)}` : '';
+    return `[${page}${bbox}${heading}] ${compactText(block.text, '', 1000)}`;
+  }).filter((line) => !/^\[[^\]]+\]\s*$/.test(line));
+  return lines.length ? lines.join('\n') : fallback;
 }
 
 async function parseDataSheet(input) {
@@ -672,25 +691,58 @@ async function parseDataSheet(input) {
   }
   let text = '';
   let tables = [];
+  let layout = { blocks: [], visuals: [], engine: 'text-fallback' };
   if (extension === '.pdf') {
     let extracted = false;
-    try {
-      const tempBase = process.env.TMPDIR || os.tmpdir() || '.';
-      const directory = await mkdtemp(path.join(tempBase, 'fusion-datasheet-'));
-      const source = path.join(directory, 'source.pdf');
+    // OpenDataLoader is the primary path: it preserves document order,
+    // table cells, headings and geometric provenance instead of flattening
+    // a datasheet into regex-only text.
+    if (process.env.FUSION_PDF_ENGINE !== 'fallback') {
       try {
-        await writeFile(source, bytes);
-        const python = process.env.PYTHON_PATH || 'python3';
-        const structured = JSON.parse(await execFileText(python, [PDF_TABLE_EXTRACTOR_PATH, source]));
-        text = String(structured.text || '');
-        tables = Array.isArray(structured.tables) ? structured.tables : [];
-        extracted = Boolean(text.trim());
-      } finally {
-        await rm(directory, { recursive: true, force: true }).catch(() => {});
+        const tempBase = process.env.TMPDIR || os.tmpdir() || '.';
+        const directory = await mkdtemp(path.join(tempBase, 'fusion-datasheet-'));
+        const source = path.join(directory, 'source.pdf');
+        try {
+          await writeFile(source, bytes);
+          const python = process.env.PYTHON_PATH || 'python3';
+          const output = path.join(directory, 'opendataloader');
+          const structured = JSON.parse(await execFileText(python, [OPENDATALOADER_EXTRACTOR_PATH, source, output], { timeout: 120000 }));
+          text = String(structured.text || '');
+          tables = Array.isArray(structured.tables) ? structured.tables : [];
+          layout = {
+            blocks: Array.isArray(structured.blocks) ? structured.blocks : [],
+            visuals: Array.isArray(structured.visuals) ? structured.visuals : [],
+            engine: structured.engine || 'opendataloader'
+          };
+          text = linearizeLayoutBlocks(layout.blocks, text);
+          extracted = Boolean(text.trim());
+        } finally {
+          await rm(directory, { recursive: true, force: true }).catch(() => {});
+        }
+      } catch {
+        // OpenDataLoader is optional in a native installation. Keep a structured
+        // pdfplumber fallback before accepting text-only extraction.
       }
-    } catch {
-      // Table extractor is optional for native installs; retain a text-only
-      // fallback for documents without extractable cell geometry.
+    }
+    if (!extracted) {
+      try {
+        const tempBase = process.env.TMPDIR || os.tmpdir() || '.';
+        const directory = await mkdtemp(path.join(tempBase, 'fusion-datasheet-'));
+        const source = path.join(directory, 'source.pdf');
+        try {
+          await writeFile(source, bytes);
+          const python = process.env.PYTHON_PATH || 'python3';
+          const structured = JSON.parse(await execFileText(python, [PDF_TABLE_EXTRACTOR_PATH, source]));
+          text = String(structured.text || '');
+          tables = Array.isArray(structured.tables) ? structured.tables : [];
+          layout = { blocks: [], visuals: [], engine: 'pdfplumber' };
+          extracted = Boolean(text.trim());
+        } finally {
+          await rm(directory, { recursive: true, force: true }).catch(() => {});
+        }
+      } catch {
+        // pdfplumber is unavailable or could not read this document.
+      }
     }
     if (!extracted) {
       try {
@@ -717,7 +769,7 @@ async function parseDataSheet(input) {
   } else {
     text = bytes.toString('utf8');
   }
-  const parsedRequirements = extractDataSheetRequirements(text, fileName, tables);
+  const parsedRequirements = extractDataSheetRequirements(text, fileName, tables, layout);
   const requirements = (Array.isArray(parsedRequirements) ? parsedRequirements : parsedRequirements.requirements).map(adaptDataSheetRequirement);
   const reviewCandidates = Array.isArray(parsedRequirements) ? [] : parsedRequirements.reviewCandidates;
   const globalConditions = Array.isArray(parsedRequirements) ? [] : parsedRequirements.globalConditions;
@@ -727,6 +779,9 @@ async function parseDataSheet(input) {
     sha256: createHash('sha256').update(bytes).digest('hex').slice(0, 16),
     extractedCharacters: text.length,
     extractedTables: tables.length,
+    extractedBlocks: layout.blocks.length,
+    extractedVisuals: layout.visuals.length,
+    extractionEngine: layout.engine,
     requirements,
     reviewCandidates,
     globalConditions,
@@ -734,7 +789,9 @@ async function parseDataSheet(input) {
       ? 'TI TLV271 deterministic profile'
       : /tpa311[68]d2/i.test(text)
         ? 'TI TPA3116D2 Class-D amplifier profile'
-        : tables.length ? 'pdfplumber table + universal measurement-plan extraction' : 'universal measurement-plan extraction'
+        : layout.engine === 'opendataloader'
+          ? 'OpenDataLoader layout JSON + evidence-grounded measurement-plan extraction'
+          : tables.length ? 'pdfplumber table + universal measurement-plan extraction' : 'universal measurement-plan extraction'
   };
 }
 
@@ -2434,6 +2491,10 @@ export function createApp() {
           dataSheet: {
             fileName: dataSheet.fileName,
             parser: dataSheet.parser,
+            extractionEngine: dataSheet.extractionEngine,
+            extractedBlocks: dataSheet.extractedBlocks,
+            extractedTables: dataSheet.extractedTables,
+            extractedVisuals: dataSheet.extractedVisuals,
             requirements: dataSheet.requirements,
             reviewCandidates: dataSheet.reviewCandidates,
             globalConditions: dataSheet.globalConditions

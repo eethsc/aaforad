@@ -1,8 +1,8 @@
 FROM node:22-bookworm-slim
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ngspice poppler-utils python3 python3-pip ca-certificates \
-  && python3 -m pip install --no-cache-dir --break-system-packages volare sympy pdfplumber \
+  && apt-get install -y --no-install-recommends ngspice poppler-utils python3 python3-pip default-jre-headless ca-certificates \
+  && python3 -m pip install --no-cache-dir --break-system-packages volare sympy pdfplumber opendataloader-pdf \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -18,6 +18,7 @@ RUN chmod +x /usr/local/bin/fusion-entrypoint
 
 ENV PORT=4174 \
     FUSION_SIMULATOR=ngspice \
+    FUSION_PDF_ENGINE=opendataloader \
     PYTHON_PATH=python3 \
     PDK_ROOT=/opt/pdks \
     PDK=sky130A \

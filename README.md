@@ -51,11 +51,12 @@ docker compose up --build
 
 ## 데이터시트 기반 설계
 
-설계 brief에서 PDF, TXT, Markdown 데이터시트를 최대 7 MB까지 첨부할 수 있습니다. PDF는 서버에서 `pdftotext`로 텍스트만 추출한 뒤 원본 임시 파일을 즉시 제거합니다. 추출된 사양은 파일명·해시·원문 근거와 함께 specification ledger 및 PDG assertion에 추가됩니다.
+설계 brief에서 PDF, TXT, Markdown 데이터시트를 최대 7 MB까지 첨부할 수 있습니다. PDF는 기본적으로 OpenDataLoader PDF를 사용해 heading, 표 셀, 페이지, bounding box, 그림/차트 캡션을 구조화 JSON으로 보존한 뒤 원본 임시 파일을 즉시 제거합니다. 추출된 사양은 파일명·해시·원문 근거와 함께 specification ledger 및 PDG assertion에 추가됩니다.
 
 - 연결된 deterministic testbench/oracle가 있는 사양은 검증됩니다.
 - 아직 mapping이 없는 사양은 **unmapped**으로 표시되고 export를 차단합니다. 문서 수치를 조용히 무시하지 않습니다.
-- Docker 이미지에는 PDF 추출용 Poppler와 SymPy oracle이 포함되어 있습니다.
+- Docker 이미지에는 OpenDataLoader PDF용 Java 런타임, Poppler, `pdfplumber`, SymPy oracle이 포함되어 있습니다. OpenDataLoader가 설치되지 않은 native 환경은 `pdfplumber`, 이어서 `pdftotext` fallback으로 저하됩니다.
+- 복잡한 표·스캔·차트·수식은 OpenDataLoader hybrid backend를 별도로 준비해야 합니다. 그림/차트에서 얻은 설명은 보조 review evidence이며, 보장 사양 표의 수치처럼 자동 export constraint로 승격되지 않습니다.
 
 예를 들어 TI TLV271 PDF는 공급전압, GBW, noise를 현재 adapter로 검증하고, supply current, slew rate, offset, bias current, CMRR, output current, temperature는 필요한 measurement adapter가 만들어질 때까지 fail-closed로 남습니다.
 

@@ -10,6 +10,7 @@ services:
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
       OPENROUTER_MODEL: "${OPENROUTER_MODEL:-openrouter/auto}"
       FUSION_SIMULATOR: ngspice
+      FUSION_PDF_ENGINE: "${FUSION_PDF_ENGINE:-opendataloader}"
       PDK_ROOT: /opt/pdks
       PDK: sky130A
       PDK_MODEL_FILE: /opt/pdks/sky130A/libs.tech/ngspice/sky130.lib.spice
