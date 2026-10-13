@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runPuctSearch } from './engine/mcts.mjs';
 import { runParEgo } from './engine/parego.mjs';
@@ -674,6 +675,62 @@ function linearizeLayoutBlocks(blocks, fallback) {
   return lines.length ? lines.join('\n') : fallback;
 }
 
+function nativePdfTextFallback(bytes) {
+  // Dependency-free final path for ordinary digitally-generated PDFs. It is
+  // intentionally evidence-poor, so it never claims table geometry. Limits
+  // keep a small uploaded PDF from expanding into unbounded server memory.
+  const binary = bytes.toString('binary');
+  const fragments = [];
+  const maxOutput = 4 * 1024 * 1024;
+  let total = 0;
+  let cursor = 0;
+  while (cursor < binary.length && total < maxOutput) {
+    const streamStart = binary.indexOf('stream', cursor);
+    if (streamStart < 0) break;
+    const lineEnd = binary.indexOf('\n', streamStart);
+    const endStream = lineEnd < 0 ? -1 : binary.indexOf('endstream', lineEnd + 1);
+    if (lineEnd < 0 || endStream < 0) break;
+    const stream = Buffer.from(binary.slice(lineEnd + 1, endStream).replace(/\r$/, ''), 'binary');
+    cursor = endStream + 'endstream'.length;
+    let decoded = null;
+    try { decoded = zlib.inflateSync(stream); } catch {
+      try { decoded = zlib.inflateRawSync(stream); } catch { /* non-Flate stream */ }
+    }
+    if (!decoded || decoded.length > maxOutput) continue;
+    const operators = decoded.toString('latin1');
+    // Manual literal-string scanner avoids catastrophic regex behaviour on
+    // arbitrary binary PDF streams. The result is only a last-resort text hint.
+    for (let index = 0; index < operators.length && total < maxOutput; index += 1) {
+      if (operators[index] !== '(') continue;
+      let value = '';
+      let depth = 1;
+      let escaped = false;
+      for (index += 1; index < operators.length && depth > 0 && value.length < 4096; index += 1) {
+        const character = operators[index];
+        if (escaped) {
+          value += character === 'n' || character === 'r' || character === 't' ? ' ' : character;
+          escaped = false;
+        } else if (character === '\\') {
+          escaped = true;
+        } else if (character === '(') {
+          depth += 1;
+          value += character;
+        } else if (character === ')') {
+          depth -= 1;
+          if (depth > 0) value += character;
+        } else {
+          value += character;
+        }
+      }
+      const printable = value.replace(/[^\x20-\x7E\u00A0-\u00FF]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (printable.length < 3 || !/[A-Za-z]/.test(printable)) continue;
+      fragments.push(printable);
+      total += printable.length + 1;
+    }
+  }
+  return fragments.join('\n').replace(/\s{2,}/g, ' ').trim();
+}
+
 async function parseDataSheet(input) {
   if (!input || typeof input !== 'object' || !input.contentBase64) return null;
   const fileName = compactText(input.fileName, 'datasheet', 120);
@@ -692,6 +749,7 @@ async function parseDataSheet(input) {
   let text = '';
   let tables = [];
   let layout = { blocks: [], visuals: [], engine: 'text-fallback' };
+  const extractionAttempts = [];
   if (extension === '.pdf') {
     let extracted = false;
     // OpenDataLoader is the primary path: it preserves document order,
@@ -719,12 +777,13 @@ async function parseDataSheet(input) {
         } finally {
           await rm(directory, { recursive: true, force: true }).catch(() => {});
         }
-      } catch {
+      } catch (error) {
+        extractionAttempts.push('OpenDataLoader: ' + compactText(error instanceof Error ? error.message : String(error), 'unavailable', 180));
         // OpenDataLoader is optional in a native installation. Keep a structured
         // pdfplumber fallback before accepting text-only extraction.
       }
     }
-    if (!extracted) {
+    if (!extracted && process.env.FUSION_PDF_ENGINE !== 'native') {
       try {
         const tempBase = process.env.TMPDIR || os.tmpdir() || '.';
         const directory = await mkdtemp(path.join(tempBase, 'fusion-datasheet-'));
@@ -732,7 +791,7 @@ async function parseDataSheet(input) {
         try {
           await writeFile(source, bytes);
           const python = process.env.PYTHON_PATH || 'python3';
-          const structured = JSON.parse(await execFileText(python, [PDF_TABLE_EXTRACTOR_PATH, source]));
+          const structured = JSON.parse(await execFileText(python, [PDF_TABLE_EXTRACTOR_PATH, source], { timeout: 15000 }));
           text = String(structured.text || '');
           tables = Array.isArray(structured.tables) ? structured.tables : [];
           layout = { blocks: [], visuals: [], engine: 'pdfplumber' };
@@ -740,29 +799,41 @@ async function parseDataSheet(input) {
         } finally {
           await rm(directory, { recursive: true, force: true }).catch(() => {});
         }
-      } catch {
+      } catch (error) {
+        extractionAttempts.push('pdfplumber: ' + compactText(error instanceof Error ? error.message : String(error), 'unavailable', 180));
         // pdfplumber is unavailable or could not read this document.
       }
     }
-    if (!extracted) {
+    if (!extracted && process.env.FUSION_PDF_ENGINE !== 'native') {
       try {
         const tempBase = process.env.TMPDIR || os.tmpdir() || '.';
         const directory = await mkdtemp(path.join(tempBase, 'fusion-datasheet-'));
         const source = path.join(directory, 'source.pdf');
         try {
           await writeFile(source, bytes);
-          text = await execFileText('pdftotext', ['-layout', source, '-']);
+          text = await execFileText('pdftotext', ['-layout', source, '-'], { timeout: 15000 });
           extracted = Boolean(text.trim());
         } finally {
           await rm(directory, { recursive: true, force: true }).catch(() => {});
         }
-      } catch {
+      } catch (error) {
+        extractionAttempts.push('pdftotext: ' + compactText(error instanceof Error ? error.message : String(error), 'unavailable', 180));
         // pdftotext executable not present or failed
       }
     }
 
+    if (!extracted) {
+      text = nativePdfTextFallback(bytes);
+      if (text) {
+        layout = { blocks: [], visuals: [], engine: 'native-flate-text' };
+        extracted = true;
+      } else {
+        extractionAttempts.push('native Flate text: no readable text operators');
+      }
+    }
+
     if (!extracted || !text.trim()) {
-      const error = new Error('PDF extraction failed. Install pdfplumber or Poppler pdftotext, or upload a text-based datasheet.');
+      const error = new Error('PDF extraction failed. The document may be scanned, encrypted, or use unsupported font encoding. ' + extractionAttempts.join(' | '));
       error.statusCode = 422;
       throw error;
     }
