@@ -193,8 +193,40 @@ Object.assign(TEMPLATE_LIBRARY, {
 });
 
 function inferredDataSheetCircuit(dataSheet) {
+  if (dataSheet?.classification?.circuit && TEMPLATE_LIBRARY[dataSheet.classification.circuit]) {
+    return dataSheet.classification.circuit;
+  }
   if (dataSheet?.parser === 'TI TPA3116D2 Class-D amplifier profile') return 'class_d_audio_amp';
   return null;
+}
+
+// This is deliberately a document-level classifier, rather than a vendor-part
+// profile.  A datasheet selects a *circuit family*; it must never silently
+// inherit the last UI selection (for example, TIA) just because the user did
+// not choose a dropdown value.
+function classifyDataSheetCircuit(text, fileName = '') {
+  const corpus = `${fileName}\n${text}`.replace(/\s+/g, ' ').toLowerCase();
+  const families = [
+    ['class_d_audio_amp', /\bclass[- ]?d\b|btl\s+(?:audio|speaker)|audio\s+power\s+amplifier/],
+    ['bandgap_reference', /\b(?:precision|series|voltage)\s+reference\b|\breference voltage\b|\bbandgap\b|\bvref\b|\bref\d{2,}[a-z0-9-]*\b/],
+    ['ldo', /\blow[- ]dropout\b|\bldo\b|linear\s+regulator/],
+    ['tia', /\btransimpedance\b|\bcurrent[- ]to[- ]voltage\b|\bphotodiode\b/],
+    ['sar_adc', /\bsar\s+adc\b|successive[- ]approximation\b/],
+    ['delta_sigma_adc', /(?:delta[- ]sigma|sigma[- ]delta)\s+(?:adc|modulator)/],
+    ['dynamic_comparator', /\b(?:dynamic|latched|strongarm)\s+comparator\b/],
+    ['pll', /\bphase[- ]locked\s+loop\b|\bcharge[- ]pump\s+pll\b/],
+    ['ring_oscillator', /\bring\s+oscillator\b/],
+    ['charge_pump', /\bcharge\s+pump\b/],
+    ['buck_converter', /\bbuck\s+(?:converter|regulator)\b|step[- ]down\s+(?:converter|regulator)/],
+    ['active_rc_filter', /\bactive[- ]?rc\b|\b(?:low|high|band)[- ]pass\s+filter\b/],
+    ['current_mirror', /\bcurrent\s+mirror\b/],
+    ['two_stage_ota', /\b(?:operational\s+amplifier|op[ -]?amp|operational transconductance amplifier|\bota\b)\b/]
+  ];
+  for (const [circuit, pattern] of families) {
+    const match = corpus.match(pattern);
+    if (match) return { circuit, confidence: 'high', evidence: match[0] };
+  }
+  return { circuit: null, confidence: 'unknown', evidence: null };
 }
 
 function assessPlatformEligibility(template, spec, pdkProfile) {
@@ -508,6 +540,25 @@ function tableUnit(row, unitIndex) {
     || joined.match(/(?:nV\s*\/\s*√?Hz|V\s*\/\s*[µu]s|mV|µV|nA|µA|mA|pA|MHz|kHz|GHz|dB|°C|mW|W|V|%|ns|µs|us)/i))?.[0]?.replace(/\s+/g, '') || '';
 }
 
+function unitCompatibleWithMetric(metric, unit) {
+  const normalized = String(unit || '').toLowerCase().replace(/\s+/g, '');
+  if (!normalized) return false;
+  const rules = {
+    supply: /^(?:[munp]?v)$/, gain: /^db$/, ugbw: /^(?:hz|khz|mhz|ghz)$/,
+    phase: /^(?:deg|°)$/, power: /^(?:w|mw|uw|µw|nw)$/,
+    supply_current: /^(?:a|ma|ua|µa|na|pa)$/, input_bias_current: /^(?:a|ma|ua|µa|na|pa)$/,
+    input_offset_voltage: /^(?:v|mv|uv|µv|nv)$/, operating_temperature: /^(?:°c|c)$/,
+    settling: /^(?:s|ms|us|µs|ns|ps)$/, slew_rate: /^(?:v\/us|v\/µs)$/,
+    noise: /^(?:v|mv|uv|µv|nv)\/√?hz$/, output_power: /^(?:w|mw|uw|µw)$/,
+    psrr: /^db$/, cmrr: /^db$/, thd_n: /^%$/
+  };
+  return rules[metric] ? rules[metric].test(normalized) : true;
+}
+
+function isUnsafeSupplyDescriptor(descriptor) {
+  return /\b(?:absolute\s+max(?:imum)?|maximum\s+ratings?|supply\s+voltage\s*,?\s*(?:in|input)\s+to\s+gnd|input\s+to\s+ground|breakdown)\b/i.test(descriptor);
+}
+
 function extractTableRequirements(tables, fileName) {
   const requirements = [];
   for (const table of Array.isArray(tables) ? tables : []) {
@@ -530,6 +581,13 @@ function extractTableRequirements(tables, fileName) {
       const adapter = measurementAdapterFor(descriptor);
       if (!adapter) continue;
       const unit = tableUnit(row, unitIndex);
+      // A Min/Typ/Max table may be an absolute-max table after its heading is
+      // lost.  Never turn "IN to GND 7 V" into a required operating VDD.
+      if (adapter.metric === 'supply' && isUnsafeSupplyDescriptor(descriptor)) continue;
+      // Values with an incompatible dimension (for example µVpp promoted as
+      // nV/√Hz noise, or 0.1 % promoted as settling time) are evidence for a
+      // human/vision review, not deterministic circuit assertions.
+      if (!unitCompatibleWithMetric(adapter.metric, unit)) continue;
       const rowCondition = conditionIndex >= 0 ? row[conditionIndex] : '';
       const context = [table.heading, table.caption].filter(Boolean).join(' · ');
       const bbox = Array.isArray(table.bbox) ? ` bbox=${table.bbox.join(',')}` : '';
@@ -587,6 +645,10 @@ function extractGenericDataSheetRequirements(text, fileName, tables = [], layout
     // Supply is parsed above because a table's Min/Typ/Max columns and a
     // condition such as "VDD = 1.8 V" have different contractual meaning.
     if (adapter.metric === 'supply') continue;
+    if (!unitCompatibleWithMetric(adapter.metric, match[2])) {
+      if (reviewCandidates.length < 12 && !reviewCandidates.includes(source)) reviewCandidates.push(source);
+      continue;
+    }
     const key = adapter.metric + '|' + match[1] + '|' + match[2].toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -844,6 +906,7 @@ async function parseDataSheet(input) {
   const requirements = (Array.isArray(parsedRequirements) ? parsedRequirements : parsedRequirements.requirements).map(adaptDataSheetRequirement);
   const reviewCandidates = Array.isArray(parsedRequirements) ? [] : parsedRequirements.reviewCandidates;
   const globalConditions = Array.isArray(parsedRequirements) ? [] : parsedRequirements.globalConditions;
+  const classification = classifyDataSheetCircuit(text, fileName);
   return {
     fileName,
     mimeType: compactText(input.mimeType, extension === '.pdf' ? 'application/pdf' : 'text/plain', 80),
@@ -856,6 +919,7 @@ async function parseDataSheet(input) {
     requirements,
     reviewCandidates,
     globalConditions,
+    classification,
     parser: /tlv271/i.test(text)
       ? 'TI TLV271 deterministic profile'
       : /tpa311[68]d2/i.test(text)
@@ -2332,9 +2396,16 @@ export async function runDesignCycle(rawInput = {}) {
     ? await runOpenRouterVerifier(effectiveSpec, template, symbolicOracle, sizing.constraints, pdg)
     : { name: 'Verifier', output: { llmVerdict: 'pass', riskSummary: 'test-only deterministic bypass', testIntent: [] } };
   const exportsAllowed = sizing.verified && platformEligibility.compatible && symbolicOracle.available && symbolicOracle.allPassed;
-  const exportedNetlist = exportsAllowed ? makeNetlist(template, effectiveSpec, sizing.variables, pdkProfile) : null;
+  // Keep a generated candidate visible even when strict sign-off fails.  The
+  // old gate erased the only tangible output and made it look as though the
+  // agent had not designed anything.  Download/export remains strict; this is
+  // an inspect-only artefact until every assertion is discharged.
+  const candidateAllowed = platformEligibility.compatible;
+  const candidateNetlist = candidateAllowed ? makeNetlist(template, effectiveSpec, sizing.variables, pdkProfile) : null;
+  const exportedNetlist = exportsAllowed ? candidateNetlist : null;
   const measurementPlan = buildMeasurementPlan(specificationLedger);
-  const exportedTestbench = exportsAllowed ? makeTestbench(template, effectiveSpec, pdkProfile, specificationLedger) : null;
+  const candidateTestbench = candidateAllowed ? makeTestbench(template, effectiveSpec, pdkProfile, specificationLedger) : null;
+  const exportedTestbench = exportsAllowed ? candidateTestbench : null;
   const ngspice = await detectNgspice();
   const pdk = await detectPdk();
   let simulation = ngspice.available && pdk.available
@@ -2422,8 +2493,9 @@ export async function runDesignCycle(rawInput = {}) {
     retrieval: knowledge,
     learnedKnowledge: { retrieved: knowledge.sizingKnowledge, extracted: fourViewKnowledge.views, persistence: knowledgePersistence },
     sources: knowledge.items,
-    netlist: exportedNetlist,
-    testbench: exportedTestbench,
+    netlist: candidateNetlist,
+    testbench: candidateTestbench,
+    artifactStatus: exportsAllowed ? 'verified-exportable' : candidateAllowed ? 'candidate-unverified' : 'withheld-pdk-mismatch',
     simulation,
     simulationAdapter,
     symbolicOracle,
@@ -2563,6 +2635,7 @@ export function createApp() {
             fileName: dataSheet.fileName,
             parser: dataSheet.parser,
             extractionEngine: dataSheet.extractionEngine,
+            classification: dataSheet.classification,
             extractedBlocks: dataSheet.extractedBlocks,
             extractedTables: dataSheet.extractedTables,
             extractedVisuals: dataSheet.extractedVisuals,

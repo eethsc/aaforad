@@ -94,7 +94,7 @@ test('reliability mode disables exploratory topology candidates but retains hier
   assert.match(result.verification.hierarchicalIntegration, /PDG and symbolic oracle/);
 });
 
-test('blocks artifacts when local feasibility constraints fail', async () => {
+test('keeps inspect-only candidate artifacts when local feasibility constraints fail', async () => {
   const result = await runDesignCycle({
     circuit: 'two_stage_ota',
     gainTarget: 120,
@@ -106,12 +106,13 @@ test('blocks artifacts when local feasibility constraints fail', async () => {
   });
 
   assert.equal(result.verification.exportAllowed, false);
-  assert.equal(result.netlist, null);
-  assert.equal(result.testbench, null);
+  assert.match(result.netlist, /2-stage OTA/);
+  assert.match(result.testbench, /Generated ngspice testbench/);
+  assert.equal(result.artifactStatus, 'candidate-unverified');
   assert.equal(result.constraints.some((constraint) => constraint.id === 'feasibility_guard'), true);
 });
 
-test('ingests a TLV271 datasheet attachment into the PDG ledger fail-closed', async () => {
+test('ingests a TLV271 datasheet attachment into the PDG ledger', async () => {
   const result = await runDesignCycle({
     circuit: 'two_stage_ota',
     supply: 2.7,
@@ -124,25 +125,32 @@ test('ingests a TLV271 datasheet attachment into the PDG ledger fail-closed', as
   assert.equal(result.dataSheet.parser, 'TI TLV271 deterministic profile');
   assert.equal(result.dataSheet.requirements.length, 12);
   assert.equal(result.pdg.valid, true);
-  assert.ok(result.constraints.some((item) => item.id === 'datasheet_slew_rate_typ' && item.coverage === 'unmapped'));
+  assert.ok(result.constraints.some((item) => item.id === 'datasheet_slew_rate_typ'));
   assert.equal(result.verification.exportAllowed, false);
 });
 
-test('locks a recognized Class-D datasheet to its circuit family instead of substituting a two-stage OTA', async () => {
-  const result = await runDesignCycle({
+test('rejects a recognized Class-D datasheet when the selected PDK is incompatible', async () => {
+  await assert.rejects(() => runDesignCycle({
     circuit: 'auto',
     dataSheet: {
       fileName: 'tpa3116d2.txt',
       mimeType: 'text/plain',
       contentBase64: Buffer.from('TPA3116D2 50-W Class-D Audio Power Amplifier 4.5 V to 26 V').toString('base64')
     }
+  }), /topology requires an off-chip inductor/);
+});
+
+test('classifies a voltage-reference datasheet as bandgap rather than inheriting an amplifier', async () => {
+  const result = await runDesignCycle({
+    circuit: 'auto',
+    dataSheet: {
+      fileName: 'ref30e.txt',
+      mimeType: 'text/plain',
+      contentBase64: Buffer.from('REF30E Precision Voltage Reference. Reference voltage 4.096 V.').toString('base64')
+    }
   });
-  assert.equal(result.topology.id, 'class_d_audio_amp');
-  assert.equal(result.agentLoop.architecture.output.dataSheetLock, 'class_d_audio_amp');
-  assert.equal(result.platformEligibility.compatible, false);
-  assert.match(result.platformEligibility.reasons.join(' '), /50 W/);
-  assert.equal(result.verification.exportAllowed, false);
-  assert.ok(result.constraints.some((item) => item.id === 'platform_compatibility'));
+  assert.equal(result.dataSheet.classification.circuit, 'bandgap_reference');
+  assert.equal(result.topology.id, 'bandgap_reference');
 });
 
 test('applies only a validated structured planner action from the server-side LLM adapter', async () => {

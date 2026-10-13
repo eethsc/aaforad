@@ -371,6 +371,7 @@ function variableArtifact(result) {
 
 function artifactText() {
   if (!state.result) return '실행 후 템플릿 제약 넷리스트가 이곳에 표시됩니다.';
+  if (state.artifact === 'variables') return variableArtifact(state.result);
   if (!state.result.verification.exportAllowed) {
     const eligibility = state.result.platformEligibility;
     if (eligibility && !eligibility.compatible) {
@@ -382,12 +383,16 @@ function artifactText() {
       .filter((constraint) => !constraint.passed)
       .map((constraint) => constraint.label)
       .join(', ');
+    const candidate = state.artifact === 'testbench' ? state.result.testbench : state.result.netlist;
+    if (candidate) {
+      return 'CANDIDATE ONLY — EXPORT BLOCKED\n\n미충족 제약: ' + (failed || 'unknown') + '\n'
+        + '아래는 LLM 에이전트가 생성한 검토용 SPICE 아티팩트입니다. 수치 검증·데이터시트 assertion이 모두 통과할 때까지 다운로드/제조 사용은 차단됩니다.\n\n'
+        + candidate;
+    }
     return 'EXPORT BLOCKED\n\n미충족 제약: ' + (failed || 'unknown') + '\n'
-      + '수치 제약을 모두 통과한 뒤에만 SPICE 넷리스트와 testbench를 내보낼 수 있습니다.\n'
-      + 'LLM agent loop의 결과이며, 물리 성능은 ngspice/PDK가 없을 때만 analytic surrogate로 표시됩니다.';
+      + '현재 PDK/회로 도메인에서는 후보 SPICE 아티팩트도 생성할 수 없습니다.';
   }
   if (state.artifact === 'testbench') return state.result.testbench;
-  if (state.artifact === 'variables') return variableArtifact(state.result);
   return state.result.netlist;
 }
 
@@ -570,7 +575,8 @@ function renderAll(result) {
         ? ' · ' + result.dataSheet.reviewCandidates.length + '개 문맥 검토 대기'
         : '';
       status.textContent = result.dataSheet.fileName + ' · ' + result.dataSheet.requirements.length
-        + '개 사양 추출' + review + ' · ' + result.dataSheet.parser + ' · hash ' + result.dataSheet.sha256;
+        + '개 사양 추출' + review + (result.dataSheet.classification?.circuit ? ' · 자동 분류: ' + (result.dataSheet.classification.evidence || result.dataSheet.classification.circuit) : '')
+        + ' · ' + result.dataSheet.parser + ' · hash ' + result.dataSheet.sha256;
       status.className = 'ready';
     }
   }
